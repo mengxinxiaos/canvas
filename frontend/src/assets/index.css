@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 屏蔽默认的 body 边距，确保全屏铺满 */
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* 防止页面整体滚动 */
+}
