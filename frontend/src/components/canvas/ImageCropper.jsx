@@ -63,8 +63,8 @@ export default function ImageCropper({ node, onSave, onSplitSave, onCancel, proj
         e.stopPropagation(); e.preventDefault();
         
         const rect = containerRef.current.getBoundingClientRect();
-        const dx = (((e.clientX - startPos.x) / zoom) / rect.width) * 100;
-        const dy = (((e.clientY - startPos.y) / zoom) / rect.height) * 100;
+        const dx = (((e.clientX - startPos.x) ) / rect.width) * 100;
+        const dy = (((e.clientY - startPos.y) ) / rect.height) * 100;
         
         let newBox = { ...startBox };
         

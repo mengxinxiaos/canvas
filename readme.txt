@@ -1,0 +1,1 @@
+npx tree-cli -l 6 --ignore "node_modules,.git,.trae,dist,build,venv,.venv,__pycache__,10.0.0,alembic,alembic.ini,data,run.bat,init_admin.py,requirements.txt,public,assets,eslint.config.js,index.html,package-lock.json,postcss.config.js,tailwind.config.js,vite.config.js,yjs-server,readme.txt"
