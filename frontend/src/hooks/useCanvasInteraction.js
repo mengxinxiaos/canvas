@@ -187,7 +187,7 @@ export function useCanvasInteraction({
                             let multiBox = domCache.nodes.get('multi-selection-box');
                             if (!multiBox) {
                                 // 基于容器查找
-                                multiBox = containerRef.current?.querySelector('.engine-multi-selection-box');
+                                multiBox = document.getElementById('multi-selection-box');
                                 if (multiBox) domCache.nodes.set('multi-selection-box', multiBox);
                             }   
                             if (multiBox) {
