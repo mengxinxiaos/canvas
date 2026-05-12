@@ -1,5 +1,15 @@
 // 可放在 import 语句下方，组件外部
 export const CHANGELOG_DATA = [
+   {
+    version: 'v1.0.4',
+    date: '2026-05-12',
+    type: 'fix', // feature | fix | optimize
+    title: 'bug修复',
+    items: [
+      '修复了裁剪功能在某些情况下失效的问题。',
+      '修复了框选框显示问题。',
+    ]
+  },
   {
     version: 'v1.0.3',
     date: '2026-04-23',
