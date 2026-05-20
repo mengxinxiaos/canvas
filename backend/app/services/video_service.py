@@ -74,7 +74,11 @@ async def process_video_task(task_id: str):
         # 2. 解析请求参数
         req = task.request_json or {}
         prompt = req.get("prompt")
-        model = req.get("model", "doubao-seedance-1-5-pro-251215")
+
+        raw_model = req.get("model", "doubao-seedance-1-5-pro-251215")
+        parts = raw_model.split("-", 1)
+        model = parts[1]
+
         provider = req.get("provider", "")
         resolution = req.get("resolution", "720p")
         ratio = req.get("aspectRatio") or req.get("ratio") or "adaptive"

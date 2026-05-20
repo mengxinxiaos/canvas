@@ -25,9 +25,10 @@ class ZhenZhenClient(BaseImageClient):
         else:
             return settings.IMAGE_API_KEY
 
-    def _build_headers(self):
+    def _build_headers(self, api_key=None):
+        target_key = api_key or self.api_key
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {target_key}",
             "Content-Type": "application/json",
         }
 
@@ -56,11 +57,12 @@ class ZhenZhenClient(BaseImageClient):
     async def generate(self, client: httpx.AsyncClient, prompt: str, model: str, aspect_ratio: str, image_size: str, image_urls=None, **kwargs):
         try:
             # 1. 创建任务
-            self.api_key = self._build_api_key(model)
+            actual_api_key = self._build_api_key(model)
+            header = self._build_headers(actual_api_key)
             payload = self._build_payload(prompt, model, aspect_ratio, image_size, image_urls)
             res = await client.post(
                 self.api_url,
-                headers=self._build_headers(),
+                headers = header,
                 params={"async": "true"},
                 json=payload,
                 timeout= self.timeout,
@@ -76,7 +78,7 @@ class ZhenZhenClient(BaseImageClient):
             max_attempts = 180 
             for _ in range(max_attempts):
                 await asyncio.sleep(5)
-                query_res = await client.get(f"{self.task_url_prefix}/{task_id}", headers=self._build_headers(), timeout=self.timeout)
+                query_res = await client.get(f"{self.task_url_prefix}/{task_id}", headers = header, timeout=self.timeout)
                 
                 if query_res.status_code != 200:
                     return None, {"code": "QUERY_FAILED", "message": f"查询失败: {query_res.text}"}
