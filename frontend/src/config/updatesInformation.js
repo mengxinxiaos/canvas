@@ -1,5 +1,14 @@
 // 可放在 import 语句下方，组件外部
 export const CHANGELOG_DATA = [
+  {
+    version: 'v1.0.4',
+    date: '2026-05-20',
+    type: 'feature', // feature | fix | optimize
+    title: '新功能',
+    items: [
+      '增加了一个sd2.0的api渠道以解决并发少的问题',
+    ]
+  },
    {
     version: 'v1.0.4',
     date: '2026-05-12',
