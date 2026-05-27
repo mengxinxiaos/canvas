@@ -10,11 +10,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tiptap/extension-mention": "^3.23.6",
+    "@tiptap/react": "^3.23.6",
+    "@tiptap/starter-kit": "^3.23.6",
     "framer-motion": "^12.38.0",
     "html2canvas": "^1.4.1",
     "lucide-react": "^0.577.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
+    "tippy.js": "^6.3.7",
     "y-websocket": "^3.0.0",
     "yjs": "^13.6.30",
     "zustand": "^5.0.11"

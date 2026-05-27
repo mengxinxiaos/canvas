@@ -1,6 +1,27 @@
 // 可放在 import 语句下方，组件外部
 export const CHANGELOG_DATA = [
   {
+    version: 'v1.0.6',
+    date: '2026-05-26',
+    type: 'fix', // feature | fix | optimize
+    title: '生成面板bug修复',
+    items: [
+      '修复调整资产引用会失效的问题',
+      
+    ]
+  },
+  {
+    version: 'v1.0.5',
+    date: '2026-05-25',
+    type: 'feature', // feature | fix | optimize
+    title: '生成面板更新',
+    items: [
+      '1.优化资产引用UI',
+      '2.增加缩略图预览功能',
+      '3.优化prompt区域显示',
+    ]
+  },
+  {
     version: 'v1.0.4',
     date: '2026-05-20',
     type: 'feature', // feature | fix | optimize

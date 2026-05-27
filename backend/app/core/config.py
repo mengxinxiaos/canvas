@@ -27,8 +27,12 @@ class Settings(BaseSettings):
     VOLCENGINE_API_KEY: Optional[str] = None
     VOLCENGINE_POXIAN_API_BASE: Optional[str] = None
     VOLCENGINE_POXIAN_API_KEY: Optional[str] = None
+    
     MINIMAX_API_BASE: Optional[str] = None
     MINIMAX_API_KEY: Optional[str] = None
+    
+    DASHSCOPE_API_KEY: str | None = None
+    ALIYUN_API_KEY: str | None = None
 
     OSS_REGION: Optional[str] = None
     OSS_BUCKET_NAME: Optional[str] = None
