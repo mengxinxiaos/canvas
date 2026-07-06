@@ -5,19 +5,19 @@ from app.services.video_generation.base import BaseVideoClient
 
 class ZhenZhenClient(BaseVideoClient):
     def __init__(self):
-        base = (settings.IMAGE_API_BASE or "https://ai.t8star.cn").rstrip("/")
+        base = (settings.ZHENZHEN_API_BASE or "https://ai.t8star.cn").rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3].rstrip("/")
         self.base_url = base
         self.api_url = f"{self.base_url}/seedance/v3/contents/generations/tasks"
         self.task_url_prefix = f"{self.base_url}/seedance/v3/contents/generations/tasks"
-        self.api_key = settings.IMAGE_API_KEY
+        self.api_key = settings.ZHENZHEN_API_KEY
        
         if not self.api_key:
             raise ValueError("API_KEY is not configured for ZhenZhen")
     
     def _build_api_key(self,model=None):
-        return settings.IMAGE_API_KEY
+        return settings.ZHENZHEN_API_KEY
 
     def _build_headers(self, api_key=None):
         target_key = api_key or self.api_key

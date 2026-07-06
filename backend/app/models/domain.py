@@ -32,6 +32,11 @@ class Project(Base):
     is_folder = Column(Boolean, default=False)
     parent_id = Column(String, nullable=True)
 
+    # 新增：真实分享凭证，不要只放前端
+    share_token = Column(String, unique=True, index=True, nullable=True)
+    share_enabled = Column(Boolean, default=False)
+    share_permission = Column(String, default="edit")  # 当前可固定 edit，为未来扩展预留
+
 class Media(Base):
     __tablename__ = "media"
     id = Column(String, primary_key=True, default=lambda: generate_id("m"))
@@ -49,3 +54,33 @@ class Task(Base):
     request_json = Column(JSON, nullable=True)
     result_json = Column(JSON, nullable=True)
     error_message = Column(Text, nullable=True)
+
+class AgentConversation(Base):
+    __tablename__ = "agent_conversations"
+
+    id = Column(String, primary_key=True, default=lambda: generate_id("ac"))
+    project_id = Column(String, ForeignKey("projects.id"), index=True, nullable=False)
+
+    # 创建人只用于记录，不用于权限隔离
+    created_by = Column(String, ForeignKey("users.id"), nullable=True)
+
+    title = Column(String, default="新对话")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class AgentMessage(Base):
+    __tablename__ = "agent_messages"
+
+    id = Column(String, primary_key=True, default=lambda: generate_id("am"))
+    conversation_id = Column(String, ForeignKey("agent_conversations.id"), index=True, nullable=False)
+
+    # user / assistant
+    role = Column(String, nullable=False)
+
+    content = Column(Text, nullable=False)
+
+    # 用来以后保存画布上下文、模型名、token、错误信息等
+    meta_json = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())

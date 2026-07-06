@@ -6,24 +6,24 @@ from app.services.image_generation.utils import _get_resolution_gpt_image
 
 class ZhenZhenClient(BaseImageClient):
     def __init__(self):
-        base = (settings.IMAGE_API_BASE or "https://ai.t8star.cn").rstrip("/")
+        base = (settings.ZHENZHEN_API_BASE or "https://ai.t8star.cn").rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3].rstrip("/")
         self.base_url = base
         self.api_url = f"{self.base_url}/v1/images/generations"
         self.task_url_prefix = f"{self.base_url}/v1/images/tasks"
-        self.api_key = settings.IMAGE_API_KEY
+        self.api_key = settings.ZHENZHEN_API_KEY
         # 轮询接口不需要长连接等待，用普通短超时即可
         self.timeout = httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0)
 
         if not self.api_key:
-            raise ValueError("IMAGE_API_KEY is not configured for ZhenZhen")
+            raise ValueError("ZHENZHEN_API_KEY is not configured for ZhenZhen")
     
     def _build_api_key(self,model):
         if "gpt" in model.lower():
-            return settings.IMAGE_API_KEY_GPT
+            return settings.ZHENZHEN_API_KEY_GPT
         else:
-            return settings.IMAGE_API_KEY
+            return settings.ZHENZHEN_API_KEY
 
     def _build_headers(self, api_key=None):
         target_key = api_key or self.api_key
@@ -44,6 +44,10 @@ class ZhenZhenClient(BaseImageClient):
         if "gpt" in safe_model:
             payload["quality"] = "high"
             payload["size"] = _get_resolution_gpt_image(image_size, aspect_ratio)
+            print(f"   👉 image_size: {image_size}")
+            print(f"   👉 aspect_ratio: {aspect_ratio}")
+            print(f"   👉 size: {payload['size']}")
+            
         else:
             payload["aspect_ratio"] = aspect_ratio or "1:1"
             if "nano-banana" in safe_model:

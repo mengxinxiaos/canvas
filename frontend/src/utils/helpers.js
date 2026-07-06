@@ -75,3 +75,21 @@ export const calculateNodeSize = (w, h, maxEdge = 360) => {
     }
 };
 
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function deepMergePatch(base, patch) {
+    const result = { ...(base || {}) };
+
+    Object.entries(patch || {}).forEach(([key, value]) => {
+        if (isPlainObject(value) && isPlainObject(result[key])) {
+            result[key] = deepMergePatch(result[key], value);
+        } else {
+            result[key] = value;
+        }
+    });
+
+    return result;
+}
+
