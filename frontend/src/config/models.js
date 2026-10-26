@@ -29,7 +29,7 @@ export const IMAGE_MODELS = [
     },
     {
         label: "香蕉2",
-        value: "gemini-3.1-flash-image-preview",
+        value: "gemini-3.1-flash-image",
         provider: "zhenzhen",
         config: {
             ...BASE_IMAGE_CONFIG
