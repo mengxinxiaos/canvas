@@ -72,5 +72,6 @@ requirements2.txt
 .trae/
 .vscode/
 .idea/
+.others/
 .DS_Store
 Thumbs.db
