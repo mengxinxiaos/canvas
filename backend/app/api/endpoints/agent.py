@@ -2,9 +2,10 @@
 # 1. 创建依赖：ConversationRepository、AgentRuntime、AgentChatService
 # 2. 接收 HTTP 请求
 # 3. 把 Service 返回值格式化成前端需要的结构
+from contextlib import closing
 import traceback
 import json
-from fastapi import APIRouter, Depends,Header
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 from sqlalchemy.orm import Session
@@ -26,6 +27,7 @@ from app.services.agent.prompt import discover_skills
 from app.repositories.conversation import ConversationRepository
 from app.services.agent.service.chat_service import AgentChatService
 from app.services.project_access import ProjectAccessPolicy
+from app.services.billing import BillingContext, billing_context
 router = APIRouter()
 
 def _sse(event: str, data: dict) -> str:
@@ -43,6 +45,45 @@ def get_conversation_repo(db: Session = Depends(get_db)) -> ConversationReposito
 def get_agent_chat_service(repo: ConversationRepository = Depends(get_conversation_repo)) -> AgentChatService:
     runtime = AgentRuntime()
     return AgentChatService(repo=repo, runtime=runtime)
+
+
+def _conversation_billing_context(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+    repo: ConversationRepository = Depends(get_conversation_repo),
+) -> BillingContext:
+    conversation = repo.get_conversation_by_id(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    ProjectAccessPolicy(repo.db).assert_can_edit(
+        project_id=conversation.project_id,
+        current_user=current_user,
+        share_token=share_token,
+    )
+    return BillingContext(
+        user_id=current_user.id,
+        project_id=conversation.project_id,
+        conversation_id=conversation_id,
+    )
+
+
+def _billing_events(context: BillingContext, events):
+    """Reset context before every yield, including thread-pool SSE iteration."""
+    iterator = iter(events)
+    try:
+        while True:
+            with billing_context(context):
+                try:
+                    event = next(iterator)
+                except StopIteration:
+                    return
+            yield event
+    finally:
+        with billing_context(context):
+            close = getattr(iterator, "close", None)
+            if close:
+                close()
 
 # ==========================================
 # 2. DTO 格式化层 (展现层逻辑)
@@ -88,11 +129,19 @@ def list_agent_skills(current_user: User = Depends(get_current_user)):
 def agent_chat(
     req: AgentChatRequest,
     current_user: User = Depends(get_current_user),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+    db: Session = Depends(get_db),
 ):
-    """纯内存对话，不落库"""
+    """聊天内容不落库；实际模型调用仍保存管理员用量记录。"""
+    if not req.projectId:
+        raise HTTPException(status_code=422, detail="projectId 不能为空")
+    ProjectAccessPolicy(db).assert_can_edit(
+        project_id=req.projectId, current_user=current_user, share_token=share_token,
+    )
     try:
         runtime = AgentRuntime()
-        result = runtime.chat(req)
+        with billing_context(BillingContext(user_id=current_user.id, project_id=req.projectId)):
+            result = runtime.chat(req)
         return {"code": 0, "message": "ok", "data": result}
     except Exception as e:
         print(traceback.format_exc())
@@ -148,7 +197,7 @@ def list_conversations(
         "data": [_conversation_to_item(c) for c in rows],
     }
 
-@router.get("/conversations/{conversation_id}")
+@router.get("/conversations/{conversation_id}", dependencies=[Depends(_conversation_billing_context)])
 def get_conversation(
     conversation_id: str,
     current_user: User = Depends(get_current_user),
@@ -179,18 +228,20 @@ def send_conversation_message(
     current_user: User | None = Depends(get_current_user),
     share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
     chat_service: AgentChatService = Depends(get_agent_chat_service),
+    usage_context: BillingContext = Depends(_conversation_billing_context),
 ):
     try:
-        data = chat_service.process_user_message(
-            conversation_id=conversation_id,
-            current_user_id=current_user.id if current_user else None,
-            content=req.content,
-            attachments=req.attachments,
-            context=req.context,
-            skill_names=req.skillNames,
-            agent_model=req.agentModel,
-            share_token=share_token,
-        )
+        with billing_context(usage_context):
+            data = chat_service.process_user_message(
+                conversation_id=conversation_id,
+                current_user_id=current_user.id if current_user else None,
+                content=req.content,
+                attachments=req.attachments,
+                context=req.context,
+                skill_names=req.skillNames,
+                agent_model=req.agentModel,
+                share_token=share_token,
+            )
 
         return {
             "code": 0,
@@ -215,17 +266,21 @@ def submit_frontend_tool_results(
     conversation_id: str,
     req: AgentFrontendToolResultRequest,
     current_user: User = Depends(get_current_user),
-    chat_service: AgentChatService = Depends(get_agent_chat_service)
+    chat_service: AgentChatService = Depends(get_agent_chat_service),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+    usage_context: BillingContext = Depends(_conversation_billing_context),
 ):
     try:
-        data = chat_service.process_frontend_tool_results(
-            conversation_id=conversation_id,
-            current_user_id=current_user.id,
-            tool_results=req.toolResults,
-            context=req.context,
-            skill_names=req.skillNames,
-            agent_model=req.agentModel,
-        )
+        with billing_context(usage_context):
+            data = chat_service.process_frontend_tool_results(
+                conversation_id=conversation_id,
+                current_user_id=current_user.id,
+                tool_results=req.toolResults,
+                context=req.context,
+                skill_names=req.skillNames,
+                agent_model=req.agentModel,
+                share_token=share_token,
+            )
         return {
             "code": 0, "message": "ok",
             "data": {
@@ -241,7 +296,7 @@ def submit_frontend_tool_results(
         print(traceback.format_exc())
         return {"code": 5000, "message": f"Agent 继续对话失败: {repr(e)}", "data": None}
 
-@router.put("/conversations/{conversation_id}")
+@router.put("/conversations/{conversation_id}", dependencies=[Depends(_conversation_billing_context)])
 def update_conversation(
     conversation_id: str,
     req: AgentConversationUpdateRequest,
@@ -257,7 +312,7 @@ def update_conversation(
 
     return {"code": 0, "message": "ok", "data": _conversation_to_item(c)}
 
-@router.delete("/conversations/{conversation_id}")
+@router.delete("/conversations/{conversation_id}", dependencies=[Depends(_conversation_billing_context)])
 def delete_conversation(
     conversation_id: str,
     current_user: User = Depends(get_current_user),
@@ -269,59 +324,54 @@ def delete_conversation(
     
     return {"code": 0, "message": "ok", "data": {"id": conversation_id}}
 
-@router.post("/conversations/{conversation_id}/messages/stream")
-def send_conversation_message_stream(
-    conversation_id: str,
-    req: AgentSendMessageRequest,
-    current_user: User | None = Depends(get_current_user),
-    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
-    chat_service: AgentChatService = Depends(get_agent_chat_service),
-):
+def _stream_response(events, usage_context: BillingContext):
     def event_generator():
         try:
-            for event in chat_service.process_user_message_stream(
-                conversation_id=conversation_id,
-                current_user_id=current_user.id if current_user else None,
-                content=req.content,
-                attachments=req.attachments,
-                context=req.context,
-                skill_names=req.skillNames,
-                agent_model=req.agentModel,
-                share_token=share_token,
-            ):
-                event_type = event.get("type")
-
-                if event_type == "delta":
-                    yield _sse("delta", {
-                        "content": event.get("content", ""),
-                    })
-                    continue
-
-                if event_type == "final":
-                    yield _sse("final", {
-                        "conversation": _conversation_to_item(event["conversation"]),
-                        "message": _message_to_item(event["message"]),
-                        "status": event["status"],
-                        "frontendActions": event["frontendActions"],
-                    })
-                    continue
-
+            with closing(_billing_events(usage_context, events)) as tracked_events:
+                for event in tracked_events:
+                    event_type = event.get("type")
+                    if event_type == "delta":
+                        yield _sse("delta", {"content": event.get("content", "")})
+                    elif event_type == "final":
+                        yield _sse("final", {
+                            "conversation": _conversation_to_item(event["conversation"]),
+                            "message": _message_to_item(event["message"]),
+                            "status": event["status"],
+                            "frontendActions": event["frontendActions"],
+                        })
             yield _sse("done", {})
-
-        except Exception as e:
+        except Exception as exc:
             print(traceback.format_exc())
-            yield _sse("error", {
-                "message": f"Agent 流式调用失败: {repr(e)}",
-            })
+            yield _sse("error", {"message": f"Agent 流式调用失败: {repr(exc)}"})
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+def send_conversation_message_stream(
+    conversation_id: str,
+    req: AgentSendMessageRequest,
+    current_user: User = Depends(get_current_user),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+    chat_service: AgentChatService = Depends(get_agent_chat_service),
+    usage_context: BillingContext = Depends(_conversation_billing_context),
+):
+    events = chat_service.process_user_message_stream(
+        conversation_id=conversation_id,
+        current_user_id=current_user.id,
+        content=req.content,
+        attachments=req.attachments,
+        context=req.context,
+        skill_names=req.skillNames,
+        agent_model=req.agentModel,
+        share_token=share_token,
+    )
+    return _stream_response(events, usage_context)
+
 
 @router.post("/conversations/{conversation_id}/tool-results/stream")
 def submit_frontend_tool_results_stream(
@@ -330,48 +380,15 @@ def submit_frontend_tool_results_stream(
     current_user: User = Depends(get_current_user),
     share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
     chat_service: AgentChatService = Depends(get_agent_chat_service),
+    usage_context: BillingContext = Depends(_conversation_billing_context),
 ):
-    def event_generator():
-        try:
-            for event in chat_service.process_frontend_tool_results_stream(
-                conversation_id=conversation_id,
-                current_user_id=current_user.id,
-                tool_results=req.toolResults,
-                context=req.context,
-                skill_names=req.skillNames,
-                agent_model=req.agentModel,
-                share_token=share_token,
-            ):
-                event_type = event.get("type")
-
-                if event_type == "delta":
-                    yield _sse("delta", {
-                        "content": event.get("content", ""),
-                    })
-                    continue
-
-                if event_type == "final":
-                    yield _sse("final", {
-                        "conversation": _conversation_to_item(event["conversation"]),
-                        "message": _message_to_item(event["message"]),
-                        "status": event["status"],
-                        "frontendActions": event["frontendActions"],
-                    })
-                    continue
-
-            yield _sse("done", {})
-
-        except Exception as e:
-            print(traceback.format_exc())
-            yield _sse("error", {
-                "message": f"Agent 工具接力流式调用失败: {repr(e)}",
-            })
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+    events = chat_service.process_frontend_tool_results_stream(
+        conversation_id=conversation_id,
+        current_user_id=current_user.id,
+        tool_results=req.toolResults,
+        context=req.context,
+        skill_names=req.skillNames,
+        agent_model=req.agentModel,
+        share_token=share_token,
     )
+    return _stream_response(events, usage_context)

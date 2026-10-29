@@ -1,10 +1,11 @@
-import asyncio
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, Header
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from app.core.database import get_db
-from app.models.domain import Task
+from app.models.domain import Task, User
+from app.core.deps import get_current_user
+from app.services.project_access import ProjectAccessPolicy
 from app.services.video_service import process_video_task
 
 router = APIRouter()
@@ -33,12 +34,19 @@ class VideoTaskRequest(BaseModel):
     aspectRatio: Optional[str] = None
     inputs: Optional[List[Dict[str, Any]]] = []
 
-def run_async_task(coroutine):
-    asyncio.run(coroutine)
-
 @router.post("/video-generation")
-def create_video_task(req: VideoTaskRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def create_video_task(
+    req: VideoTaskRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+):
+    ProjectAccessPolicy(db).assert_can_edit(
+        project_id=req.projectId, current_user=current_user, share_token=share_token,
+    )
     t = Task(
+        user_id=current_user.id,
         project_id=req.projectId,
         node_id=req.nodeId,
         task_type="video_generation", 
@@ -49,5 +57,5 @@ def create_video_task(req: VideoTaskRequest, background_tasks: BackgroundTasks, 
     db.commit()
     db.refresh(t)
     
-    background_tasks.add_task(run_async_task, process_video_task(t.id))
+    background_tasks.add_task(process_video_task, t.id)
     return {"code": 0, "message": "ok", "data": {"taskId": t.id, "status": "pending"}}

@@ -1,10 +1,12 @@
 // components/Sidebar.jsx
 import React, { useState } from 'react';
-import { LogOut, Settings, User as UserIcon, Shield, LayoutDashboard } from 'lucide-react';
+import { LogOut, Settings, User as UserIcon, Shield, LayoutDashboard, Activity } from 'lucide-react';
 import UserManagementPage from './UserManagementPage'; 
+import ApiUsagePanel from './ApiUsagePanel';
 
 export default function Sidebar({ currentUser, onLogout }) {
     const [showUserModal, setShowUserModal] = useState(false);
+    const [showUsagePanel, setShowUsagePanel] = useState(false);
 
     if (!currentUser) return null;
     const isAdmin = currentUser.role === 'admin';
@@ -44,6 +46,16 @@ export default function Sidebar({ currentUser, onLogout }) {
                             项目空间
                         </span>
                     </button>
+                    {isAdmin && (
+                        <button
+                            onClick={() => setShowUsagePanel(true)}
+                            className="flex items-center w-full h-11 rounded-xl text-white/50 hover:text-white hover:bg-white/5 transition-colors overflow-hidden shrink-0"
+                            title="API 调用与费用"
+                        >
+                            <div className="w-[48px] flex items-center justify-center shrink-0"><Activity size={20} /></div>
+                            <span className="text-sm font-medium opacity-0 group-hover:opacity-100 whitespace-nowrap transition-opacity duration-300">调用与费用</span>
+                        </button>
+                    )}
                 </div>
 
                 {/* 3. 底部用户与操作区 */}
@@ -99,11 +111,14 @@ export default function Sidebar({ currentUser, onLogout }) {
             </aside>
 
             {/* 管理弹窗 */}
-            {showUserModal && (
+            {isAdmin && showUserModal && (
                 <UserManagementPage
                     currentUser={currentUser}
                     onClose={() => setShowUserModal(false)}
                 />
+            )}
+            {isAdmin && showUsagePanel && (
+                <ApiUsagePanel currentUser={currentUser} onClose={() => setShowUsagePanel(false)} />
             )}
         </>
     );

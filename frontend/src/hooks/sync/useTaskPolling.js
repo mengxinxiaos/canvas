@@ -3,7 +3,7 @@ import { taskService } from '../../services/api';
 import { getMediaUrl, getImageDimensions,getVideoDimensions, calculateNodeSize } from '../../utils/helpers';
 import useCanvasStore from '../../store/useCanvasStore';
 
-export function useTaskPolling(updateNodeStrictAndSave) {
+export function useTaskPolling(updateNodeStrictAndSave, shareToken) {
     const nodes = useCanvasStore(state => state.nodes);
     const pendingTasksRef = useRef([]);
 
@@ -18,7 +18,7 @@ export function useTaskPolling(updateNodeStrictAndSave) {
 
             for (const node of pendingNodes) {
                 try {
-                    const status = await taskService.queryTaskStatus(node.taskId);
+                    const status = await taskService.queryTaskStatus(node.taskId, shareToken);
                     console.log(`\n========================================`);
                     console.log(`📥 [轮询数据] 任务 ${node.taskId} 后端完整返回:`, status);
 
@@ -129,5 +129,5 @@ export function useTaskPolling(updateNodeStrictAndSave) {
 
         const timer = setInterval(poll, 3000);
         return () => clearInterval(timer);
-    }, [updateNodeStrictAndSave]);
+    }, [updateNodeStrictAndSave, shareToken]);
 }

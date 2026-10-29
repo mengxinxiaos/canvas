@@ -7,7 +7,7 @@ import { CANVAS_CONFIG } from '../config/canvas.config';
 import { getDimensionsByRatio } from '../utils/helpers';
 
 export function useNodeOperations({
-    projectId, containerRef, canvasWrapperRef,screenToCanvas,
+    projectId, shareToken, containerRef, canvasWrapperRef,screenToCanvas,
     dispatchAndSave, updateNodeStrictAndSave, showToast,
     setSelection, setDragState, setContextMenu, setEdgeMenu,
     setPreviewMedia, setVisiblePrompts, drawingNodeId, croppingNodeId,
@@ -184,13 +184,14 @@ export function useNodeOperations({
         // 将脏活累活全部抛给纯函数处理
         await aiGenerationService.submitTask({
             projectId,
+            shareToken,
             genParams,
             canvasState,
             updateNodeStrictAndSave,
             pushHistory,
             showToast
         });
-    }, [projectId, updateNodeStrictAndSave, pushHistory, showToast]);
+    }, [projectId, shareToken, updateNodeStrictAndSave, pushHistory, showToast]);
 
     // ================= 4. 节点常规交互事件集合 =================
     const nodeActions = useMemo(() => ({

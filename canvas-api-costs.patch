@@ -1,0 +1,3628 @@
+diff --git a/backend/API_COSTS.md b/backend/API_COSTS.md
+new file mode 100644
+index 0000000..9de9f33
+--- /dev/null
++++ b/backend/API_COSTS.md
+@@ -0,0 +1,43 @@
++# API 调用与费用面板
++
++基于 `feature/agent` 的 `66b9a39` 实现。使用现有 SQLite，不维护模型价格表、不估算费用。
++
++## 启用
++
++1. 停止后端，备份当前使用的 SQLite 数据库。
++2. 在项目根目录应用补丁：`git apply --check canvas-api-costs.patch`，检查通过后运行 `git apply canvas-api-costs.patch`。
++3. 进入 `backend`，在原虚拟环境执行 `pip install -r requirements.txt`，随后执行 `alembic upgrade head`。
++4. 重启后端。进入 `frontend`，安装现有依赖并执行 `npm run build`，按原项目方式更新前端。
++5. 以 `role=admin` 的账号登录，在项目空间左侧栏打开“调用与费用”。
++
++迁移沿用现有 Alembic 链，要求现有项目数据库和迁移基线已经正确建立；不要在已有数据的数据库上随意执行 `alembic stamp`。新增 Task 字段必须通过迁移添加，启动时的 `create_all()` 不会修改现有 Task 表。
++
++当前仓库的锁文件存在上游依赖不一致，验证构建时使用 `npm install --no-package-lock` 安装，没有改动锁文件。
++
++## 记录规则
++
++- 图片、视频、Agent 主调用、历史总结均记录服务端认证用户、项目、供应商、模型、时间和状态。
++- zhenzhen、火山等仅提取响应协议层明确返回的 `cost`，包括 `data`、`usage`、`billing` 等对象封装；不搜索提示词、模型输出或任意数组，不推算缺失费用。
++- MiniMax 与阿里云费用始终为 `NULL`，面板显示“暂不采集”。其他未返回费用的响应显示“未返回”；明确返回的零费用保留为零。
++- 金额以十进制字符串保存和返回，汇总使用 Decimal。币种或单位没有返回时不推断为人民币，按供应商分别汇总未知单位。
++- 供应商成功后先保存费用，再下载生成文件；本地下载失败不会抹掉已返回费用。
++- 视频提交与后续轮询归属同一条生成记录。Agent 重试分别记录，关联同一操作编号；SDK 隐藏重试关闭，沿用应用层恢复流程。
++- 流式响应仅采集实际收到的费用和用量块，不强制发送供应商未确认支持的额外参数。缺失费用保持空值。
++- 仅记录启用后的新调用，不从历史项目所有者推断历史调用用户或补造费用。
++
++## 权限与接口
++
++- `GET /api/admin/api-calls`：分页明细。
++- `GET /api/admin/api-calls/summary`：汇总及筛选选项。
++- 两个接口都根据后端数据库中的当前角色验证 admin，普通用户返回 HTTP 403，未登录返回 HTTP 401。
++- 普通生成和任务查询接口要求登录及项目访问权限。共享项目继续通过 `X-Project-Share-Token` 传递权限，调用身份始终取登录用户。
++- 明细保存在独立表中，用户/项目名称为快照，不随删除对话而级联删除；没有存储提示词、API Key 或完整供应商响应。
++- 日期筛选按北京时间计算起止边界；开始时间在数据库中为 UTC。
++
++## 验证和边界
++
++在后端环境安装 `pytest` 后，运行 `python -m pytest tests -q`。测试全部使用临时 SQLite、模拟供应商响应或内存 HTTP transport，不调用付费模型。
++
++上线前仍需各取一份实际成功响应核对 `cost` 所在位置及单位；如果供应商只返回 usage，没有 cost，此版本不会自行计算价格。未使用真实密钥做付费联调。
++
++进程退出时未完成的调用可能保留“进行中”。已保存供应商任务编号，但本次未实现自动恢复、远端取消或超时后账单对账。不要把本地超时理解为供应商没有收费。
+diff --git a/backend/alembic/versions/b81e4a30c912_add_api_call_records.py b/backend/alembic/versions/b81e4a30c912_add_api_call_records.py
+new file mode 100644
+index 0000000..b7d6b5e
+--- /dev/null
++++ b/backend/alembic/versions/b81e4a30c912_add_api_call_records.py
+@@ -0,0 +1,62 @@
++"""Track provider-reported API costs without a local price table.
++
++Revision ID: b81e4a30c912
++Revises: 800a2d829333
++"""
++from alembic import op
++import sqlalchemy as sa
++
++revision = "b81e4a30c912"
++down_revision = "800a2d829333"
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    # create_all() is also used at app startup in this project. Inspect first so
++    # upgrading after an application restart still works without duplicate tables.
++    bind = op.get_bind()
++    task_columns = {c["name"] for c in sa.inspect(bind).get_columns("tasks")}
++    for name in ("user_id", "api_call_id"):
++        if name not in task_columns:
++            op.add_column("tasks", sa.Column(name, sa.String(), nullable=True))
++
++    if "api_call_records" in sa.inspect(bind).get_table_names():
++        return
++    op.create_table(
++        "api_call_records",
++        sa.Column("id", sa.String(), primary_key=True),
++        sa.Column("operation_id", sa.String(), nullable=False),
++        sa.Column("user_id", sa.String(), nullable=True),
++        sa.Column("user_name", sa.String(), nullable=True),
++        sa.Column("project_id", sa.String(), nullable=True),
++        sa.Column("project_name", sa.String(), nullable=True),
++        sa.Column("node_id", sa.String(), nullable=True),
++        sa.Column("task_id", sa.String(), nullable=True),
++        sa.Column("conversation_id", sa.String(), nullable=True),
++        sa.Column("call_type", sa.String(), nullable=False),
++        sa.Column("provider", sa.String(), nullable=False),
++        sa.Column("model", sa.String(), nullable=False),
++        sa.Column("status", sa.String(), nullable=False),
++        sa.Column("cost", sa.Text(), nullable=True),
++        sa.Column("currency", sa.String(), nullable=True),
++        sa.Column("cost_status", sa.String(), nullable=False),
++        sa.Column("usage_json", sa.JSON(), nullable=True),
++        sa.Column("provider_request_id", sa.String(), nullable=True),
++        sa.Column("parameters_json", sa.JSON(), nullable=True),
++        sa.Column("started_at", sa.DateTime(), nullable=False),
++        sa.Column("completed_at", sa.DateTime(), nullable=True),
++        sa.Column("duration_ms", sa.Integer(), nullable=True),
++        sa.Column("error_message", sa.Text(), nullable=True),
++    )
++    op.create_index("ix_api_call_records_operation_id", "api_call_records", ["operation_id"])
++    op.create_index("ix_api_calls_started_id", "api_call_records", ["started_at", "id"])
++    op.create_index("ix_api_calls_user_started", "api_call_records", ["user_id", "started_at"])
++    op.create_index("ix_api_calls_project_started", "api_call_records", ["project_id", "started_at"])
++
++
++def downgrade():
++    op.drop_table("api_call_records")
++    with op.batch_alter_table("tasks") as batch:
++        batch.drop_column("api_call_id")
++        batch.drop_column("user_id")
+diff --git a/backend/app/api/endpoints/agent.py b/backend/app/api/endpoints/agent.py
+index 9def807..9bbf1e0 100644
+--- a/backend/app/api/endpoints/agent.py
++++ b/backend/app/api/endpoints/agent.py
+@@ -2,9 +2,10 @@
+ # 1. 创建依赖：ConversationRepository、AgentRuntime、AgentChatService
+ # 2. 接收 HTTP 请求
+ # 3. 把 Service 返回值格式化成前端需要的结构
++from contextlib import closing
+ import traceback
+ import json
+-from fastapi import APIRouter, Depends,Header
++from fastapi import APIRouter, Depends, Header, HTTPException
+ from fastapi.responses import StreamingResponse
+ 
+ from sqlalchemy.orm import Session
+@@ -26,6 +27,7 @@ from app.services.agent.prompt import discover_skills
+ from app.repositories.conversation import ConversationRepository
+ from app.services.agent.service.chat_service import AgentChatService
+ from app.services.project_access import ProjectAccessPolicy
++from app.services.billing import BillingContext, billing_context
+ router = APIRouter()
+ 
+ def _sse(event: str, data: dict) -> str:
+@@ -44,6 +46,45 @@ def get_agent_chat_service(repo: ConversationRepository = Depends(get_conversati
+     runtime = AgentRuntime()
+     return AgentChatService(repo=repo, runtime=runtime)
+ 
++
++def _conversation_billing_context(
++    conversation_id: str,
++    current_user: User = Depends(get_current_user),
++    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
++    repo: ConversationRepository = Depends(get_conversation_repo),
++) -> BillingContext:
++    conversation = repo.get_conversation_by_id(conversation_id)
++    if conversation is None:
++        raise HTTPException(status_code=404, detail="对话不存在")
++    ProjectAccessPolicy(repo.db).assert_can_edit(
++        project_id=conversation.project_id,
++        current_user=current_user,
++        share_token=share_token,
++    )
++    return BillingContext(
++        user_id=current_user.id,
++        project_id=conversation.project_id,
++        conversation_id=conversation_id,
++    )
++
++
++def _billing_events(context: BillingContext, events):
++    """Reset context before every yield, including thread-pool SSE iteration."""
++    iterator = iter(events)
++    try:
++        while True:
++            with billing_context(context):
++                try:
++                    event = next(iterator)
++                except StopIteration:
++                    return
++            yield event
++    finally:
++        with billing_context(context):
++            close = getattr(iterator, "close", None)
++            if close:
++                close()
++
+ # ==========================================
+ # 2. DTO 格式化层 (展现层逻辑)
+ # ==========================================
+@@ -88,11 +129,19 @@ def list_agent_skills(current_user: User = Depends(get_current_user)):
+ def agent_chat(
+     req: AgentChatRequest,
+     current_user: User = Depends(get_current_user),
++    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
++    db: Session = Depends(get_db),
+ ):
+-    """纯内存对话，不落库"""
++    """聊天内容不落库；实际模型调用仍保存管理员用量记录。"""
++    if not req.projectId:
++        raise HTTPException(status_code=422, detail="projectId 不能为空")
++    ProjectAccessPolicy(db).assert_can_edit(
++        project_id=req.projectId, current_user=current_user, share_token=share_token,
++    )
+     try:
+         runtime = AgentRuntime()
+-        result = runtime.chat(req)
++        with billing_context(BillingContext(user_id=current_user.id, project_id=req.projectId)):
++            result = runtime.chat(req)
+         return {"code": 0, "message": "ok", "data": result}
+     except Exception as e:
+         print(traceback.format_exc())
+@@ -148,7 +197,7 @@ def list_conversations(
+         "data": [_conversation_to_item(c) for c in rows],
+     }
+ 
+-@router.get("/conversations/{conversation_id}")
++@router.get("/conversations/{conversation_id}", dependencies=[Depends(_conversation_billing_context)])
+ def get_conversation(
+     conversation_id: str,
+     current_user: User = Depends(get_current_user),
+@@ -179,18 +228,20 @@ def send_conversation_message(
+     current_user: User | None = Depends(get_current_user),
+     share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+     chat_service: AgentChatService = Depends(get_agent_chat_service),
++    usage_context: BillingContext = Depends(_conversation_billing_context),
+ ):
+     try:
+-        data = chat_service.process_user_message(
+-            conversation_id=conversation_id,
+-            current_user_id=current_user.id if current_user else None,
+-            content=req.content,
+-            attachments=req.attachments,
+-            context=req.context,
+-            skill_names=req.skillNames,
+-            agent_model=req.agentModel,
+-            share_token=share_token,
+-        )
++        with billing_context(usage_context):
++            data = chat_service.process_user_message(
++                conversation_id=conversation_id,
++                current_user_id=current_user.id if current_user else None,
++                content=req.content,
++                attachments=req.attachments,
++                context=req.context,
++                skill_names=req.skillNames,
++                agent_model=req.agentModel,
++                share_token=share_token,
++            )
+ 
+         return {
+             "code": 0,
+@@ -215,17 +266,21 @@ def submit_frontend_tool_results(
+     conversation_id: str,
+     req: AgentFrontendToolResultRequest,
+     current_user: User = Depends(get_current_user),
+-    chat_service: AgentChatService = Depends(get_agent_chat_service)
++    chat_service: AgentChatService = Depends(get_agent_chat_service),
++    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
++    usage_context: BillingContext = Depends(_conversation_billing_context),
+ ):
+     try:
+-        data = chat_service.process_frontend_tool_results(
+-            conversation_id=conversation_id,
+-            current_user_id=current_user.id,
+-            tool_results=req.toolResults,
+-            context=req.context,
+-            skill_names=req.skillNames,
+-            agent_model=req.agentModel,
+-        )
++        with billing_context(usage_context):
++            data = chat_service.process_frontend_tool_results(
++                conversation_id=conversation_id,
++                current_user_id=current_user.id,
++                tool_results=req.toolResults,
++                context=req.context,
++                skill_names=req.skillNames,
++                agent_model=req.agentModel,
++                share_token=share_token,
++            )
+         return {
+             "code": 0, "message": "ok",
+             "data": {
+@@ -241,7 +296,7 @@ def submit_frontend_tool_results(
+         print(traceback.format_exc())
+         return {"code": 5000, "message": f"Agent 继续对话失败: {repr(e)}", "data": None}
+ 
+-@router.put("/conversations/{conversation_id}")
++@router.put("/conversations/{conversation_id}", dependencies=[Depends(_conversation_billing_context)])
+ def update_conversation(
+     conversation_id: str,
+     req: AgentConversationUpdateRequest,
+@@ -257,7 +312,7 @@ def update_conversation(
+ 
+     return {"code": 0, "message": "ok", "data": _conversation_to_item(c)}
+ 
+-@router.delete("/conversations/{conversation_id}")
++@router.delete("/conversations/{conversation_id}", dependencies=[Depends(_conversation_billing_context)])
+ def delete_conversation(
+     conversation_id: str,
+     current_user: User = Depends(get_current_user),
+@@ -269,59 +324,54 @@ def delete_conversation(
+     
+     return {"code": 0, "message": "ok", "data": {"id": conversation_id}}
+ 
+-@router.post("/conversations/{conversation_id}/messages/stream")
+-def send_conversation_message_stream(
+-    conversation_id: str,
+-    req: AgentSendMessageRequest,
+-    current_user: User | None = Depends(get_current_user),
+-    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+-    chat_service: AgentChatService = Depends(get_agent_chat_service),
+-):
++def _stream_response(events, usage_context: BillingContext):
+     def event_generator():
+         try:
+-            for event in chat_service.process_user_message_stream(
+-                conversation_id=conversation_id,
+-                current_user_id=current_user.id if current_user else None,
+-                content=req.content,
+-                attachments=req.attachments,
+-                context=req.context,
+-                skill_names=req.skillNames,
+-                agent_model=req.agentModel,
+-                share_token=share_token,
+-            ):
+-                event_type = event.get("type")
+-
+-                if event_type == "delta":
+-                    yield _sse("delta", {
+-                        "content": event.get("content", ""),
+-                    })
+-                    continue
+-
+-                if event_type == "final":
+-                    yield _sse("final", {
+-                        "conversation": _conversation_to_item(event["conversation"]),
+-                        "message": _message_to_item(event["message"]),
+-                        "status": event["status"],
+-                        "frontendActions": event["frontendActions"],
+-                    })
+-                    continue
+-
++            with closing(_billing_events(usage_context, events)) as tracked_events:
++                for event in tracked_events:
++                    event_type = event.get("type")
++                    if event_type == "delta":
++                        yield _sse("delta", {"content": event.get("content", "")})
++                    elif event_type == "final":
++                        yield _sse("final", {
++                            "conversation": _conversation_to_item(event["conversation"]),
++                            "message": _message_to_item(event["message"]),
++                            "status": event["status"],
++                            "frontendActions": event["frontendActions"],
++                        })
+             yield _sse("done", {})
+-
+-        except Exception as e:
++        except Exception as exc:
+             print(traceback.format_exc())
+-            yield _sse("error", {
+-                "message": f"Agent 流式调用失败: {repr(e)}",
+-            })
++            yield _sse("error", {"message": f"Agent 流式调用失败: {repr(exc)}"})
+ 
+     return StreamingResponse(
+         event_generator(),
+         media_type="text/event-stream",
+-        headers={
+-            "Cache-Control": "no-cache",
+-            "X-Accel-Buffering": "no",
+-        },
++        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
++    )
++
++
++@router.post("/conversations/{conversation_id}/messages/stream")
++def send_conversation_message_stream(
++    conversation_id: str,
++    req: AgentSendMessageRequest,
++    current_user: User = Depends(get_current_user),
++    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
++    chat_service: AgentChatService = Depends(get_agent_chat_service),
++    usage_context: BillingContext = Depends(_conversation_billing_context),
++):
++    events = chat_service.process_user_message_stream(
++        conversation_id=conversation_id,
++        current_user_id=current_user.id,
++        content=req.content,
++        attachments=req.attachments,
++        context=req.context,
++        skill_names=req.skillNames,
++        agent_model=req.agentModel,
++        share_token=share_token,
+     )
++    return _stream_response(events, usage_context)
++
+ 
+ @router.post("/conversations/{conversation_id}/tool-results/stream")
+ def submit_frontend_tool_results_stream(
+@@ -330,48 +380,15 @@ def submit_frontend_tool_results_stream(
+     current_user: User = Depends(get_current_user),
+     share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+     chat_service: AgentChatService = Depends(get_agent_chat_service),
++    usage_context: BillingContext = Depends(_conversation_billing_context),
+ ):
+-    def event_generator():
+-        try:
+-            for event in chat_service.process_frontend_tool_results_stream(
+-                conversation_id=conversation_id,
+-                current_user_id=current_user.id,
+-                tool_results=req.toolResults,
+-                context=req.context,
+-                skill_names=req.skillNames,
+-                agent_model=req.agentModel,
+-                share_token=share_token,
+-            ):
+-                event_type = event.get("type")
+-
+-                if event_type == "delta":
+-                    yield _sse("delta", {
+-                        "content": event.get("content", ""),
+-                    })
+-                    continue
+-
+-                if event_type == "final":
+-                    yield _sse("final", {
+-                        "conversation": _conversation_to_item(event["conversation"]),
+-                        "message": _message_to_item(event["message"]),
+-                        "status": event["status"],
+-                        "frontendActions": event["frontendActions"],
+-                    })
+-                    continue
+-
+-            yield _sse("done", {})
+-
+-        except Exception as e:
+-            print(traceback.format_exc())
+-            yield _sse("error", {
+-                "message": f"Agent 工具接力流式调用失败: {repr(e)}",
+-            })
+-
+-    return StreamingResponse(
+-        event_generator(),
+-        media_type="text/event-stream",
+-        headers={
+-            "Cache-Control": "no-cache",
+-            "X-Accel-Buffering": "no",
+-        },
+-    )
+\ No newline at end of file
++    events = chat_service.process_frontend_tool_results_stream(
++        conversation_id=conversation_id,
++        current_user_id=current_user.id,
++        tool_results=req.toolResults,
++        context=req.context,
++        skill_names=req.skillNames,
++        agent_model=req.agentModel,
++        share_token=share_token,
++    )
++    return _stream_response(events, usage_context)
+diff --git a/backend/app/api/endpoints/billing.py b/backend/app/api/endpoints/billing.py
+new file mode 100644
+index 0000000..d294656
+--- /dev/null
++++ b/backend/app/api/endpoints/billing.py
+@@ -0,0 +1,144 @@
++"""Read-only administrator view of provider-reported costs."""
++from collections import defaultdict
++from datetime import date, datetime, time, timedelta, timezone
++from decimal import Decimal, InvalidOperation, localcontext
++from zoneinfo import ZoneInfo
++
++from fastapi import APIRouter, Depends, HTTPException, Query
++from sqlalchemy.orm import Session
++
++from app.core.database import get_db
++from app.core.deps import get_current_user
++from app.models.domain import APICall, User
++
++router = APIRouter()
++SHANGHAI = ZoneInfo("Asia/Shanghai")
++
++
++def require_admin(current_user: User = Depends(get_current_user)):
++    if current_user.role != "admin":
++        raise HTTPException(status_code=403, detail="仅管理员可查看 API 调用数据")
++    return current_user
++
++
++def call_filters(
++    start_date: date | None = None,
++    end_date: date | None = None,
++    user_id: str | None = None,
++    project_id: str | None = None,
++    provider: str | None = None,
++    model: str | None = None,
++    call_type: str | None = None,
++    status: str | None = None,
++    cost_status: str | None = None,
++):
++    if start_date and end_date and start_date > end_date:
++        raise HTTPException(status_code=422, detail="开始日期不能晚于结束日期")
++    filters = []
++    if start_date:
++        start = datetime.combine(start_date, time.min, SHANGHAI)
++        filters.append(APICall.started_at >= start.astimezone(timezone.utc).replace(tzinfo=None))
++    if end_date:
++        # Exclusive next midnight includes all microseconds of the selected day.
++        end = datetime.combine(end_date, time.min, SHANGHAI) + timedelta(days=1)
++        filters.append(APICall.started_at < end.astimezone(timezone.utc).replace(tzinfo=None))
++    for name, value in (
++        ("user_id", user_id), ("project_id", project_id),
++        ("provider", provider), ("model", model), ("call_type", call_type),
++        ("status", status), ("cost_status", cost_status),
++    ):
++        if value:
++            filters.append(getattr(APICall, name) == value)
++    return filters
++
++
++def _iso(value):
++    return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z") if value else None
++
++
++def _item(row):
++    names = (
++        "id", "operation_id", "user_id", "user_name", "project_id", "project_name",
++        "node_id", "task_id", "conversation_id", "call_type", "provider", "model",
++        "status", "cost", "currency", "cost_status", "usage_json",
++        "provider_request_id", "parameters_json", "duration_ms", "error_message",
++    )
++    result = {name: getattr(row, name) for name in names}
++    result.update(started_at=_iso(row.started_at), completed_at=_iso(row.completed_at))
++    return result
++
++
++def _cost_totals(rows):
++    totals = {}
++    for row in rows:
++        if row.cost_status != "reported" or row.cost is None:
++            continue
++        try:
++            amount = Decimal(row.cost)
++        except (InvalidOperation, ValueError):
++            continue
++        if not amount.is_finite() or amount < 0:
++            continue
++        # Never combine unknown units across suppliers or infer a fiat currency.
++        key = (row.currency, None if row.currency else row.provider)
++        total = totals.setdefault(key, {"currency": key[0], "provider": key[1], "cost": Decimal(0), "calls": 0})
++        with localcontext() as context:
++            context.prec = 256
++            total["cost"] += amount
++        total["calls"] += 1
++    return [
++        {**value, "cost": format(value["cost"], "f")}
++        for _, value in sorted(totals.items(), key=lambda item: (item[0][0] or "", item[0][1] or ""))
++    ]
++
++
++@router.get("/api-calls", dependencies=[Depends(require_admin)])
++def list_api_calls(
++    filters: list = Depends(call_filters),
++    page: int = Query(1, ge=1),
++    page_size: int = Query(20, ge=1, le=100),
++    db: Session = Depends(get_db),
++):
++    query = db.query(APICall).filter(*filters)
++    total = query.count()
++    rows = query.order_by(APICall.started_at.desc(), APICall.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
++    return {"code": 0, "message": "ok", "data": {
++        "items": [_item(row) for row in rows], "total": total,
++        "page": page, "page_size": page_size,
++    }}
++
++
++@router.get("/api-calls/summary", dependencies=[Depends(require_admin)])
++def summarize_api_calls(filters: list = Depends(call_filters), db: Session = Depends(get_db)):
++    # Select only lightweight columns; don't load response/parameter JSON for aggregation.
++    columns = (APICall.user_id, APICall.user_name, APICall.provider, APICall.model,
++               APICall.status, APICall.cost, APICall.currency, APICall.cost_status)
++    rows = db.query(*columns).filter(*filters).all()
++    users = defaultdict(list)
++    models = defaultdict(list)
++    for row in rows:
++        users[row.user_id].append(row)
++        models[(row.provider, row.model)].append(row)
++    # Options span all saved records so selecting one filter doesn't hide the others.
++    user_options = dict(db.query(APICall.user_id, APICall.user_name).filter(APICall.user_id.isnot(None)).distinct().all())
++    project_options = dict(db.query(APICall.project_id, APICall.project_name).filter(APICall.project_id.isnot(None)).distinct().all())
++    return {"code": 0, "message": "ok", "data": {
++        "total_calls": len(rows),
++        "success_calls": sum(row.status == "success" for row in rows),
++        "failed_calls": sum(row.status in ("failed", "interrupted") for row in rows),
++        "pending_calls": sum(row.status not in ("success", "failed", "interrupted") for row in rows),
++        "reported_cost_calls": sum(row.cost_status == "reported" and row.cost is not None for row in rows),
++        "missing_cost_calls": sum(row.cost_status != "reported" or row.cost is None for row in rows),
++        "cost_totals": _cost_totals(rows),
++        "by_user": [{"user_id": uid, "user_name": group[-1].user_name or uid or "未知用户",
++                     "calls": len(group), "cost_totals": _cost_totals(group)}
++                    for uid, group in sorted(users.items(), key=lambda pair: (-len(pair[1]), pair[0] or ""))],
++        "by_model": [{"provider": key[0], "model": key[1], "calls": len(group), "cost_totals": _cost_totals(group)}
++                     for key, group in sorted(models.items(), key=lambda pair: (-len(pair[1]), pair[0]))],
++        "options": {
++            "users": [{"id": key, "name": value or key} for key, value in sorted(user_options.items())],
++            "projects": [{"id": key, "name": value or key} for key, value in sorted(project_options.items())],
++            "providers": [r[0] for r in db.query(APICall.provider).distinct().order_by(APICall.provider).all()],
++            "models": [r[0] for r in db.query(APICall.model).distinct().order_by(APICall.model).all()],
++        },
++    }}
+diff --git a/backend/app/api/endpoints/image_tasks.py b/backend/app/api/endpoints/image_tasks.py
+index fc059f5..db95d0a 100644
+--- a/backend/app/api/endpoints/image_tasks.py
++++ b/backend/app/api/endpoints/image_tasks.py
+@@ -1,10 +1,12 @@
+-from fastapi import APIRouter, Depends, BackgroundTasks
++from fastapi import APIRouter, Depends, BackgroundTasks, Header
+ from sqlalchemy.orm import Session
+ from pydantic import BaseModel
+ from typing import Optional, List, Dict, Any
+ 
+ from app.core.database import get_db
+-from app.models.domain import Task
++from app.models.domain import Task, User
++from app.core.deps import get_current_user
++from app.services.project_access import ProjectAccessPolicy
+ # 假设这里引入的是我们上一步重构好的异步核心逻辑
+ from app.services.image_service import process_image_task 
+ 
+@@ -26,10 +28,16 @@ class ImageTaskRequest(BaseModel):
+ def create_image_task(
+     req: ImageTaskRequest, 
+     background_tasks: BackgroundTasks, 
+-    db: Session = Depends(get_db)
++    db: Session = Depends(get_db),
++    current_user: User = Depends(get_current_user),
++    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+ ):
++    ProjectAccessPolicy(db).assert_can_edit(
++        project_id=req.projectId, current_user=current_user, share_token=share_token,
++    )
+     # 1. 创建并保存任务记录 (Pending 状态)
+     t = Task(
++        user_id=current_user.id,
+         project_id=req.projectId,
+         node_id=req.nodeId,
+         task_type="image_generation", 
+diff --git a/backend/app/api/endpoints/tasks.py b/backend/app/api/endpoints/tasks.py
+index 956b339..b399c36 100644
+--- a/backend/app/api/endpoints/tasks.py
++++ b/backend/app/api/endpoints/tasks.py
+@@ -1,16 +1,26 @@
+-from fastapi import APIRouter, Depends
++from fastapi import APIRouter, Depends, Header
+ from sqlalchemy.orm import Session
+ from app.core.database import get_db
+-from app.models.domain import Task
++from app.models.domain import Task, User
++from app.core.deps import get_current_user
++from app.services.project_access import ProjectAccessPolicy
+ 
+ router = APIRouter()
+ 
+ @router.get("/{task_id}")
+-def get_task_status(task_id: str, db: Session = Depends(get_db)):
++def get_task_status(
++    task_id: str,
++    db: Session = Depends(get_db),
++    current_user: User = Depends(get_current_user),
++    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
++):
+     t = db.query(Task).filter(Task.id == task_id).first()
+     if not t:
+         return {"code": 404, "message": "任务不存在"}
+-        
++
++    ProjectAccessPolicy(db).assert_can_view(
++        project_id=t.project_id, current_user=current_user, share_token=share_token,
++    )
+     return {
+         "code": 0, 
+         "message": "ok", 
+diff --git a/backend/app/api/endpoints/video_tasks.py b/backend/app/api/endpoints/video_tasks.py
+index 1986a18..e437577 100644
+--- a/backend/app/api/endpoints/video_tasks.py
++++ b/backend/app/api/endpoints/video_tasks.py
+@@ -1,10 +1,11 @@
+-import asyncio
+-from fastapi import APIRouter, Depends, BackgroundTasks
++from fastapi import APIRouter, Depends, BackgroundTasks, Header
+ from sqlalchemy.orm import Session
+ from pydantic import BaseModel
+ from typing import Optional, List, Dict, Any
+ from app.core.database import get_db
+-from app.models.domain import Task
++from app.models.domain import Task, User
++from app.core.deps import get_current_user
++from app.services.project_access import ProjectAccessPolicy
+ from app.services.video_service import process_video_task
+ 
+ router = APIRouter()
+@@ -33,12 +34,19 @@ class VideoTaskRequest(BaseModel):
+     aspectRatio: Optional[str] = None
+     inputs: Optional[List[Dict[str, Any]]] = []
+ 
+-def run_async_task(coroutine):
+-    asyncio.run(coroutine)
+-
+ @router.post("/video-generation")
+-def create_video_task(req: VideoTaskRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
++def create_video_task(
++    req: VideoTaskRequest,
++    background_tasks: BackgroundTasks,
++    db: Session = Depends(get_db),
++    current_user: User = Depends(get_current_user),
++    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
++):
++    ProjectAccessPolicy(db).assert_can_edit(
++        project_id=req.projectId, current_user=current_user, share_token=share_token,
++    )
+     t = Task(
++        user_id=current_user.id,
+         project_id=req.projectId,
+         node_id=req.nodeId,
+         task_type="video_generation", 
+@@ -49,5 +57,5 @@ def create_video_task(req: VideoTaskRequest, background_tasks: BackgroundTasks,
+     db.commit()
+     db.refresh(t)
+     
+-    background_tasks.add_task(run_async_task, process_video_task(t.id))
++    background_tasks.add_task(process_video_task, t.id)
+     return {"code": 0, "message": "ok", "data": {"taskId": t.id, "status": "pending"}}
+\ No newline at end of file
+diff --git a/backend/app/api/router.py b/backend/app/api/router.py
+index 7d52732..87c8692 100644
+--- a/backend/app/api/router.py
++++ b/backend/app/api/router.py
+@@ -1,5 +1,5 @@
+ from fastapi import APIRouter
+-from app.api.endpoints import auth, projects, media, tasks, image_tasks, video_tasks, agent
++from app.api.endpoints import auth, projects, media, tasks, image_tasks, video_tasks, agent, billing
+ 
+ api_router = APIRouter()
+ api_router.include_router(auth.router, prefix="/auth", tags=["Auth"])
+@@ -11,4 +11,5 @@ api_router.include_router(image_tasks.router, prefix="/tasks", tags=["Image Gene
+ api_router.include_router(video_tasks.router, prefix="/tasks", tags=["Video Generation"])
+ api_router.include_router(tasks.router, prefix="/tasks", tags=["Task Status"])
+ 
+-api_router.include_router(agent.router, prefix="/agent", tags=["Agent"])
+\ No newline at end of file
++api_router.include_router(agent.router, prefix="/agent", tags=["Agent"])
++api_router.include_router(billing.router, prefix="/admin", tags=["API Usage"])
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index c510ec4..75bc94e 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -9,6 +9,9 @@ class Settings(BaseSettings):
+     
+ 
+     # Agent / LLM
++    AGENT_API_KEY: Optional[str] = None
++    AGENT_BASE_URL: Optional[str] = None
++    AGENT_MODEL: str = ""
+    
+     AGENT_DEFAULT_MAX_TOKENS: int = 8192
+     AGENT_ESCALATED_MAX_TOKENS: int = 64000
+@@ -60,4 +63,4 @@ class Settings(BaseSettings):
+     def get_cors_origins(self) -> List[str]:
+         return [x.strip() for x in self.CORS_ORIGINS.split(",") if x.strip()]
+ 
+-settings = Settings()
+\ No newline at end of file
++settings = Settings()
+diff --git a/backend/app/models/domain.py b/backend/app/models/domain.py
+index 953ede0..1e590e7 100644
+--- a/backend/app/models/domain.py
++++ b/backend/app/models/domain.py
+@@ -1,4 +1,4 @@
+-from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Text,Boolean
++from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Text,Boolean, Index
+ from sqlalchemy.orm import declarative_base
+ from sqlalchemy.sql import func
+ import uuid
+@@ -54,6 +54,46 @@ class Task(Base):
+     request_json = Column(JSON, nullable=True)
+     result_json = Column(JSON, nullable=True)
+     error_message = Column(Text, nullable=True)
++    user_id = Column(String, nullable=True)
++    api_call_id = Column(String, nullable=True)
++
++
++class APICall(Base):
++    """Provider-reported usage; retained independently of deleted projects/messages.
++
++    Decimal amounts are stored as text to preserve provider precision in SQLite.
++    A missing cost/currency stays NULL; no price estimation or currency inference.
++    """
++    __tablename__ = "api_call_records"
++    __table_args__ = (
++        Index("ix_api_calls_started_id", "started_at", "id"),
++        Index("ix_api_calls_user_started", "user_id", "started_at"),
++        Index("ix_api_calls_project_started", "project_id", "started_at"),
++    )
++
++    id = Column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
++    operation_id = Column(String, nullable=False, index=True)
++    user_id = Column(String, nullable=True)
++    user_name = Column(String, nullable=True)
++    project_id = Column(String, nullable=True)
++    project_name = Column(String, nullable=True)
++    node_id = Column(String, nullable=True)
++    task_id = Column(String, nullable=True)
++    conversation_id = Column(String, nullable=True)
++    call_type = Column(String, nullable=False)
++    provider = Column(String, nullable=False)
++    model = Column(String, nullable=False)
++    status = Column(String, nullable=False, default="pending")
++    cost = Column(Text, nullable=True)
++    currency = Column(String, nullable=True)
++    cost_status = Column(String, nullable=False, default="pending")
++    usage_json = Column(JSON, nullable=True)
++    provider_request_id = Column(String, nullable=True)
++    parameters_json = Column(JSON, nullable=True)
++    started_at = Column(DateTime, nullable=False)
++    completed_at = Column(DateTime, nullable=True)
++    duration_ms = Column(Integer, nullable=True)
++    error_message = Column(Text, nullable=True)
+ 
+ class AgentConversation(Base):
+     __tablename__ = "agent_conversations"
+@@ -83,4 +123,4 @@ class AgentMessage(Base):
+     # 用来以后保存画布上下文、模型名、token、错误信息等
+     meta_json = Column(JSON, nullable=True)
+ 
+-    created_at = Column(DateTime, server_default=func.now())
+\ No newline at end of file
++    created_at = Column(DateTime, server_default=func.now())
+diff --git a/backend/app/services/agent/llm/client_factory.py b/backend/app/services/agent/llm/client_factory.py
+index 27b7d15..bb389cc 100644
+--- a/backend/app/services/agent/llm/client_factory.py
++++ b/backend/app/services/agent/llm/client_factory.py
+@@ -51,4 +51,7 @@ def create_agent_client(provider: str | None = None) -> OpenAI:
+     return OpenAI(
+         api_key=api_key,
+         base_url=base_url,
+-    )
+\ No newline at end of file
++        # Application recovery owns retry attempts so each paid attempt can be
++        # recorded separately instead of being hidden inside the SDK.
++        max_retries=0,
++    )
+diff --git a/backend/app/services/agent/llm/gateway.py b/backend/app/services/agent/llm/gateway.py
+index 64d5769..6823730 100644
+--- a/backend/app/services/agent/llm/gateway.py
++++ b/backend/app/services/agent/llm/gateway.py
+@@ -2,6 +2,12 @@ from dataclasses import dataclass
+ from typing import Any, Protocol
+ 
+ from app.services.agent.runtime.recovery import RecoveryState, with_retry
++from app.services.billing import (
++    begin_call,
++    current_billing_context,
++    extract_billing,
++    finish_call,
++)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -37,13 +43,34 @@ class OpenAICompatibleLLMGateway:
+     所以这里仍然使用 client.chat.completions.create。
+     """
+ 
+-    def __init__(self, client: Any):
++    def __init__(self, client: Any, provider: str | None = None, call_type: str = "agent_chat"):
+         self.client = client
++        self.provider = provider or "default"
++        self.call_type = call_type
++
++    def _begin_call(self, request: LLMCompletionRequest, *, stream: bool, attempt: int):
++        context = current_billing_context.get()
++        if context is None:
++            return None
++        return begin_call(
++            user_id=context.user_id,
++            project_id=context.project_id,
++            operation_id=context.operation_id,
++            conversation_id=context.conversation_id,
++            node_id=context.node_id,
++            provider=self.provider,
++            model=request.model,
++            call_type=self.call_type,
++            parameters={"max_tokens": request.max_tokens, "stream": stream, "attempt": attempt},
++        )
+ 
+     def complete(self, request: LLMCompletionRequest) -> Any:
+         state = RecoveryState(current_model=request.model)
++        attempt = 0
+ 
+         def call_llm():
++            nonlocal attempt
++            attempt += 1
+             kwargs: dict[str, Any] = {
+                 "model": state.current_model,
+                 "messages": request.messages,
+@@ -54,14 +81,26 @@ class OpenAICompatibleLLMGateway:
+                 kwargs["tools"] = request.tools
+                 kwargs["tool_choice"] = request.tool_choice or "auto"
+ 
+-            return self.client.chat.completions.create(**kwargs)
++            call_id = self._begin_call(request, stream=False, attempt=attempt)
++            try:
++                response = self.client.chat.completions.create(**kwargs)
++            except Exception as exc:
++                if call_id:
++                    finish_call(call_id, status="failed", error=type(exc).__name__)
++                raise
++            if call_id:
++                finish_call(call_id, response=response)
++            return response
+ 
+         return with_retry(call_llm, state)
+         
+     def stream_complete(self, request: LLMCompletionRequest):
+         state = RecoveryState(current_model=request.model)
++        attempt = 0
+ 
+         def call_llm():
++            nonlocal attempt
++            attempt += 1
+             kwargs: dict[str, Any] = {
+                 "model": state.current_model,
+                 "messages": request.messages,
+@@ -73,6 +112,55 @@ class OpenAICompatibleLLMGateway:
+                 kwargs["tools"] = request.tools
+                 kwargs["tool_choice"] = request.tool_choice or "auto"
+ 
+-            return self.client.chat.completions.create(**kwargs)
+-
+-        return with_retry(call_llm, state)
+\ No newline at end of file
++            # Do not blindly request stream_options: some compatible suppliers do
++            # not support it. Capture any billing/usage chunks they actually send.
++            call_id = self._begin_call(request, stream=True, attempt=attempt)
++            try:
++                stream = self.client.chat.completions.create(**kwargs)
++            except Exception as exc:
++                if call_id:
++                    finish_call(call_id, status="failed", error=type(exc).__name__)
++                raise
++            return stream, call_id
++
++        def tracked_stream():
++            # Open lazily: closing an unconsumed generator must not leave an
++            # upstream stream or a pending call record behind.
++            stream, call_id = with_retry(call_llm, state)
++            metadata: dict[str, Any] = {}
++            status = "interrupted"
++            error = None
++            try:
++                for chunk in stream:
++                    # Usage-only chunks often have no choices. Inspect them here,
++                    # before Runtime filters content/tool deltas.
++                    incoming = extract_billing(chunk, provider=self.provider)
++                    if incoming.get("cost") is not None:
++                        metadata["cost"] = incoming["cost"]
++                        metadata["cost_status"] = incoming["cost_status"]
++                    for key in ("currency", "provider_request_id"):
++                        if incoming.get(key):
++                            metadata[key] = incoming[key]
++                    if incoming.get("usage_json"):
++                        metadata["usage_json"] = {
++                            **metadata.get("usage_json", {}),
++                            **incoming["usage_json"],
++                        }
++                    yield chunk
++                status = "success"
++            except GeneratorExit:
++                raise
++            except BaseException as exc:
++                status = "failed"
++                error = type(exc).__name__
++                raise
++            finally:
++                try:
++                    close = getattr(stream, "close", None)
++                    if close:
++                        close()
++                finally:
++                    if call_id:
++                        finish_call(call_id, status=status, metadata=metadata, error=error)
++
++        return tracked_stream()
+diff --git a/backend/app/services/agent/runtime/compaction.py b/backend/app/services/agent/runtime/compaction.py
+index d9cce23..32a2683 100644
+--- a/backend/app/services/agent/runtime/compaction.py
++++ b/backend/app/services/agent/runtime/compaction.py
+@@ -3,7 +3,7 @@ from typing import Any
+ 
+ from app.core.config import settings
+ from app.services.agent.llm.client_factory import create_agent_client
+-from app.services.agent.runtime.recovery import RecoveryState, with_retry
++from app.services.agent.llm.gateway import LLMCompletionRequest, OpenAICompatibleLLMGateway
+ 
+ 
+ def message_text(msg: dict[str, Any]) -> str:
+@@ -131,19 +131,17 @@ def summarize_history(messages: list[dict[str, Any]], model: str) -> str:
+         f"Conversation JSON:\n{conversation}"
+     )
+ 
+-    state = RecoveryState(current_model=model)
+-
+-    def call_llm():
+-        return client.chat.completions.create(
+-            model=state.current_model,
++    gateway = OpenAICompatibleLLMGateway(client, provider="default", call_type="history_summary")
++    resp = gateway.complete(
++        LLMCompletionRequest(
++            model=model,
+             messages=[
+                 {"role": "system", "content": "你负责总结 Agent 对话状态。只输出总结文本，不要调用工具。"},
+                 {"role": "user", "content": prompt},
+             ],
+             max_tokens=2000,
+         )
+-
+-    resp = with_retry(call_llm, state)
++    )
+     return (resp.choices[0].message.content or "").strip() or "(empty summary)"
+ 
+ 
+@@ -175,4 +173,4 @@ def apply_compaction_pipeline(
+     if estimate_size(system, compacted) > getattr(settings, "AGENT_CONTEXT_LIMIT", 30000):
+         compacted = compact_history(messages=compacted, model=model)
+ 
+-    return compacted
+\ No newline at end of file
++    return compacted
+diff --git a/backend/app/services/agent/runtime/runtime.py b/backend/app/services/agent/runtime/runtime.py
+index 1464e84..f93fc13 100644
+--- a/backend/app/services/agent/runtime/runtime.py
++++ b/backend/app/services/agent/runtime/runtime.py
+@@ -451,7 +451,7 @@ class AgentRuntime:
+ 
+         client = self.llm_client or runtime_model_config.client
+ 
+-        gateway = OpenAICompatibleLLMGateway(client)
++        gateway = OpenAICompatibleLLMGateway(client, provider=runtime_model_config.provider)
+ 
+         model_id = runtime_model_config.model_id
+ 
+@@ -542,7 +542,7 @@ class AgentRuntime:
+         runtime_model_config = resolve_agent_runtime_model_config(req)
+ 
+         client = self.llm_client or runtime_model_config.client
+-        gateway = OpenAICompatibleLLMGateway(client)
++        gateway = OpenAICompatibleLLMGateway(client, provider=runtime_model_config.provider)
+         model_id = runtime_model_config.model_id
+ 
+         system_prompt = self.prompt_builder.build(req)
+@@ -569,28 +569,31 @@ class AgentRuntime:
+             )
+         )
+ 
+-        for chunk in stream:
+-            if not getattr(chunk, "choices", None):
+-                continue
++        try:
++            for chunk in stream:
++                if not getattr(chunk, "choices", None):
++                    continue
+ 
+-            choice = chunk.choices[0]
+-            delta = getattr(choice, "delta", None)
++                choice = chunk.choices[0]
++                delta = getattr(choice, "delta", None)
+ 
+-            if delta is None:
+-                continue
++                if delta is None:
++                    continue
+ 
+-            content_delta = getattr(delta, "content", None) or ""
++                content_delta = getattr(delta, "content", None) or ""
+ 
+-            if content_delta:
+-                full_content += content_delta
+-                yield {
+-                    "type": "delta",
+-                    "content": content_delta,
+-                }
++                if content_delta:
++                    full_content += content_delta
++                    yield {
++                        "type": "delta",
++                        "content": content_delta,
++                    }
+ 
+-            tool_calls = getattr(delta, "tool_calls", None)
+-            if tool_calls:
+-                raw_tool_call_chunks.extend(tool_calls)
++                tool_calls = getattr(delta, "tool_calls", None)
++                if tool_calls:
++                    raw_tool_call_chunks.extend(tool_calls)
++        finally:
++            stream.close()
+ 
+         merged_tool_calls = (
+             _merge_stream_tool_call_chunks(raw_tool_call_chunks)
+@@ -642,4 +645,4 @@ class AgentRuntime:
+         return self.chat(
+             req=req,
+             allow_tools=True,
+-        )
+\ No newline at end of file
++        )
+diff --git a/backend/app/services/agent/service/chat_service.py b/backend/app/services/agent/service/chat_service.py
+index 1675f73..2ec9b17 100644
+--- a/backend/app/services/agent/service/chat_service.py
++++ b/backend/app/services/agent/service/chat_service.py
+@@ -6,6 +6,7 @@
+ # - frontend tool results 接力
+ # - assistant 协议消息持久化
+ 
++from contextlib import closing
+ from typing import Any
+ 
+ from app.repositories.conversation import ConversationRepository
+@@ -264,14 +265,15 @@ class AgentChatService:
+ 
+         final_result = None
+ 
+-        for event in self.runtime.stream_chat(req=req, allow_tools=True):
+-            if event.get("type") == "delta":
+-                yield event
+-                continue
++        with closing(self.runtime.stream_chat(req=req, allow_tools=True)) as stream:
++            for event in stream:
++                if event.get("type") == "delta":
++                    yield event
++                    continue
+ 
+-            if event.get("type") == "final":
+-                final_result = event.get("result")
+-                break
++                if event.get("type") == "final":
++                    final_result = event.get("result")
++                    break
+ 
+         if final_result is None:
+             final_result = AgentTurnResult.completed().to_dict()
+@@ -468,14 +470,15 @@ class AgentChatService:
+ 
+         final_result = None
+ 
+-        for event in self.runtime.stream_chat(req=req, allow_tools=True):
+-            if event.get("type") == "delta":
+-                yield event
+-                continue
++        with closing(self.runtime.stream_chat(req=req, allow_tools=True)) as stream:
++            for event in stream:
++                if event.get("type") == "delta":
++                    yield event
++                    continue
+ 
+-            if event.get("type") == "final":
+-                final_result = event.get("result")
+-                break
++                if event.get("type") == "final":
++                    final_result = event.get("result")
++                    break
+ 
+         if final_result is None:
+             final_result = AgentTurnResult.completed().to_dict()
+diff --git a/backend/app/services/billing.py b/backend/app/services/billing.py
+new file mode 100644
+index 0000000..12d229a
+--- /dev/null
++++ b/backend/app/services/billing.py
+@@ -0,0 +1,317 @@
++"""Persist supplier-reported API costs without a local price catalogue.
++
++An absent cost stays NULL.  No currency is inferred, and only explicitly
++allowlisted usage fields are retained from a provider response.
++"""
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from decimal import Decimal, InvalidOperation
++from typing import Any, Iterator
++import re
++import uuid
++
++from app.core.database import SessionLocal
++from app.models.domain import APICall, Project, User
++
++
++UNSUPPORTED_PROVIDERS = frozenset({"minimax", "ali", "aliyun"})
++_ENVELOPES = ("data", "result", "output", "usage", "billing", "cost_details")
++_USAGE_FIELDS = frozenset({
++    "prompt_tokens", "completion_tokens", "total_tokens", "input_tokens",
++    "output_tokens", "cached_tokens", "cache_read_input_tokens",
++    "cache_creation_input_tokens", "reasoning_tokens", "image_tokens",
++    "text_tokens", "audio_tokens", "image_count", "images", "generated_images",
++    "video_count", "duration", "duration_seconds", "video_seconds", "seconds",
++    "input_tokens_details", "output_tokens_details", "prompt_tokens_details",
++    "completion_tokens_details", "successful_requests",
++})
++_PARAMETER_FIELDS = frozenset({
++    "mode", "aspectRatio", "aspect_ratio", "imageSize", "image_size",
++    "duration", "resolution", "ratio", "max_tokens", "stream", "image_count",
++    "purpose", "attempt",
++})
++
++
++def _now() -> datetime:
++    # Existing models use naive timestamps; consistently store naive UTC.
++    return datetime.now(timezone.utc).replace(tzinfo=None)
++
++
++@dataclass(frozen=True)
++class BillingContext:
++    user_id: str | None
++    project_id: str | None
++    operation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
++    conversation_id: str | None = None
++    node_id: str | None = None
++
++
++current_billing_context: ContextVar[BillingContext | None] = ContextVar(
++    "current_billing_context", default=None,
++)
++
++
++@contextmanager
++def billing_context(context: BillingContext) -> Iterator[BillingContext]:
++    token = current_billing_context.set(context)
++    try:
++        yield context
++    finally:
++        current_billing_context.reset(token)
++
++
++def _as_dict(value: Any) -> dict:
++    if isinstance(value, dict):
++        return value
++    if hasattr(value, "model_dump"):
++        dumped = value.model_dump(exclude_none=True)
++        return dumped if isinstance(dumped, dict) else {}
++    return {}
++
++
++def _amount(value: Any) -> str | None:
++    if value is None or isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
++        return None
++    text = str(value).strip()
++    if not text or len(text) > 128:
++        return None
++    try:
++        number = Decimal(text)
++    except (InvalidOperation, ValueError):
++        return None
++    if not number.is_finite() or number < 0:
++        return None
++    # Bound hostile exponent strings before expanding them. Never round money.
++    if number.adjusted() > 60 or number.as_tuple().exponent < -60:
++        return None
++    return format(number, "f")
++
++
++def _unit(value: Any) -> str | None:
++    if not isinstance(value, str):
++        return None
++    value = value.strip()
++    if not value or len(value) > 32 or not re.fullmatch(r"[\w ./$¥€£-]+", value):
++        return None
++    return value
++
++
++def _response_nodes(response: Any) -> list[tuple[dict, str | None]]:
++    """Traverse protocol envelopes only, never prompts/content/tool arguments."""
++    root = _as_dict(response)
++    queue = [(root, None, 0)]
++    result = []
++    seen = set()
++    while queue:
++        node, inherited_unit, depth = queue.pop(0)
++        if id(node) in seen or depth > 6:
++            continue
++        seen.add(id(node))
++        unit = _unit(node.get("currency")) or _unit(node.get("cost_currency")) or inherited_unit
++        result.append((node, unit))
++        for key in _ENVELOPES:
++            child = _as_dict(node.get(key))
++            if child:
++                queue.append((child, unit, depth + 1))
++    return result
++
++
++def _safe_usage(node: dict) -> dict:
++    result = {}
++    for key, value in node.items():
++        if key not in _USAGE_FIELDS:
++            continue
++        if isinstance(value, dict):
++            nested = _safe_usage(value)
++            if nested:
++                result[key] = nested
++        elif not isinstance(value, bool) and isinstance(value, (int, float, Decimal, str)):
++            number = _amount(value)
++            if number is not None:
++                # Preserve exact decimal strings; don't introduce binary float conversion.
++                result[key] = value if isinstance(value, int) else number
++    return result
++
++
++def extract_billing(response: Any, provider: str | None = None) -> dict:
++    """Normalize explicit cost/usage fields from a raw dict or SDK response.
++
++    No totals are computed from nested items. The outermost valid cost wins.
++    MiniMax and Aliyun are deliberately excluded from cost collection.
++    """
++    nodes = _response_nodes(response)
++    cost = None
++    currency = None
++    request_id = None
++    usage = {}
++    for node, inherited_unit in nodes:
++        if request_id is None:
++            for key in ("request_id", "requestId", "task_id", "taskId", "id"):
++                candidate = node.get(key)
++                if isinstance(candidate, (str, int)) and not isinstance(candidate, bool):
++                    request_id = str(candidate)[:512]
++                    break
++        usage.update(_safe_usage(node))
++        if cost is None:
++            raw_cost = node.get("cost")
++            candidate = _amount(raw_cost)
++            candidate_unit = inherited_unit
++            if isinstance(raw_cost, dict):
++                candidate = _amount(raw_cost.get("amount"))
++                candidate_unit = _unit(raw_cost.get("currency")) or candidate_unit
++            if candidate is not None:
++                cost = candidate
++                currency = candidate_unit
++    unsupported = str(provider or "").strip().lower() in UNSUPPORTED_PROVIDERS
++    return {
++        "cost": None if unsupported else cost,
++        "currency": None if unsupported else currency,
++        "cost_status": "not_supported" if unsupported else ("reported" if cost is not None else "unavailable"),
++        "usage_json": usage,
++        "provider_request_id": request_id,
++    }
++
++
++def _safe_parameters(parameters: dict | None) -> dict:
++    return {
++        key: value[:128] if isinstance(value, str) else value
++        for key, value in (parameters or {}).items()
++        if key in _PARAMETER_FIELDS and isinstance(value, (str, int, bool, float))
++    }
++
++
++def begin_call(
++    *, user_id: str | None, project_id: str | None, provider: str | None,
++    model: str | None, call_type: str, operation_id: str | None = None,
++    node_id: str | None = None, task_id: str | None = None,
++    conversation_id: str | None = None, parameters: dict | None = None,
++) -> str:
++    """Create one observable API attempt using a short database transaction."""
++    db = SessionLocal()
++    try:
++        user = db.get(User, user_id) if user_id else None
++        project = db.get(Project, project_id) if project_id else None
++        call_id = uuid.uuid4().hex
++        unsupported = str(provider or "").strip().lower() in UNSUPPORTED_PROVIDERS
++        row = APICall(
++            id=call_id,
++            operation_id=operation_id or uuid.uuid4().hex,
++            user_id=user_id,
++            user_name=(user.display_name or user.username) if user else None,
++            project_id=project_id,
++            project_name=project.name if project else None,
++            node_id=node_id,
++            task_id=task_id,
++            conversation_id=conversation_id,
++            call_type=call_type,
++            provider=provider or "default",
++            model=model or "unknown",
++            status="started",
++            cost=None,
++            currency=None,
++            cost_status="not_supported" if unsupported else "pending",
++            usage_json={},
++            parameters_json=_safe_parameters(parameters),
++            started_at=_now(),
++        )
++        db.add(row)
++        db.commit()
++        return call_id
++    except Exception:
++        db.rollback()
++        raise
++    finally:
++        db.close()
++
++
++def _merge_metadata(row: APICall, metadata: dict | None) -> None:
++    metadata = metadata or {}
++    if isinstance(metadata.get("usage_json"), dict):
++        usage = dict(row.usage_json or {})
++        usage.update(_safe_usage(metadata["usage_json"]))
++        row.usage_json = usage
++    request_id = metadata.get("provider_request_id")
++    if request_id is not None:
++        row.provider_request_id = str(request_id)[:512]
++    if str(row.provider or "").strip().lower() in UNSUPPORTED_PROVIDERS:
++        row.cost = None
++        row.currency = None
++        row.cost_status = "not_supported"
++        return
++    cost = _amount(metadata.get("cost"))
++    if cost is not None:
++        row.cost = cost
++        row.currency = _unit(metadata.get("currency")) or row.currency
++        row.cost_status = "reported"
++
++
++def update_call(
++    call_id: str, *, provider_request_id: str | None = None,
++    metadata: dict | None = None,
++) -> None:
++    """Save an upstream task ID/normalized metadata without finishing a call."""
++    db = SessionLocal()
++    try:
++        row = db.get(APICall, call_id)
++        if row is None:
++            raise ValueError("API call record does not exist")
++        _merge_metadata(row, metadata)
++        if provider_request_id is not None:
++            row.provider_request_id = str(provider_request_id)[:512]
++        db.commit()
++    except Exception:
++        db.rollback()
++        raise
++    finally:
++        db.close()
++
++
++def _safe_error(error: Any) -> str | None:
++    if error is None:
++        return None
++    text = str(error)
++    text = re.sub(r"(?i)bearer\s+[^\s\"']+", "Bearer [redacted]", text)
++    text = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[redacted]", text)
++    return text[:1000]
++
++
++def finish_call(
++    call_id: str, *, status: str = "success", response: Any = None,
++    metadata: dict | None = None, provider_request_id: str | None = None,
++    error: Any = None,
++) -> None:
++    """Complete an existing record; repeated completion never creates a row.
++
++    Reported costs survive missing metadata on later calls. A late response may
++    still fill a previously unknown cost after a timeout or interrupted stream.
++    """
++    if status not in {"success", "failed", "interrupted"}:
++        raise ValueError("Unsupported API call status")
++    db = SessionLocal()
++    try:
++        row = db.get(APICall, call_id)
++        if row is None:
++            raise ValueError("API call record does not exist")
++        if response is not None:
++            _merge_metadata(row, extract_billing(response, provider=row.provider))
++        _merge_metadata(row, metadata)
++        if provider_request_id is not None:
++            row.provider_request_id = str(provider_request_id)[:512]
++        # A cleanup/finally handler must not overwrite an already completed call.
++        if row.completed_at is None:
++            completed = _now()
++            row.status = status
++            row.completed_at = completed
++            row.duration_ms = max(0, int((completed - row.started_at).total_seconds() * 1000))
++            row.error_message = _safe_error(error)
++        if row.cost is None and row.cost_status != "not_supported":
++            row.cost_status = "unavailable"
++        db.commit()
++    except Exception:
++        db.rollback()
++        raise
++    finally:
++        db.close()
+diff --git a/backend/app/services/image_generation/base.py b/backend/app/services/image_generation/base.py
+index b8ccc36..f0f4788 100644
+--- a/backend/app/services/image_generation/base.py
++++ b/backend/app/services/image_generation/base.py
+@@ -2,6 +2,41 @@ import httpx
+ from abc import ABC, abstractmethod
+ 
+ class BaseImageClient(ABC):
++    def __init__(self, provider: str | None = None):
++        self._reset_billing(provider=provider)
++
++    def _reset_billing(self, *, provider: str | None = None, model: str | None = None):
++        """Metadata belongs to this generation, never to a shared class dictionary."""
++        self.actual_provider = provider or getattr(self, "actual_provider", None)
++        self.actual_model = model
++        self.provider_request_id = None
++        self.generation_succeeded = False
++        self.billing_metadata = {}
++
++    def _capture_billing(self, response):
++        from app.services.billing import extract_billing
++
++        incoming = extract_billing(response, provider=self.actual_provider)
++        previous = self.billing_metadata
++        merged = {**previous, **incoming}
++        merged["usage_json"] = {
++            **(previous.get("usage_json") or {}),
++            **(incoming.get("usage_json") or {}),
++        }
++        # A later polling response may omit a cost returned at submission time.
++        if incoming.get("cost") is None and previous.get("cost") is not None:
++            for key in ("cost", "currency", "cost_status"):
++                merged[key] = previous.get(key)
++        if not incoming.get("currency") and previous.get("currency"):
++            merged["currency"] = previous["currency"]
++        if not self.provider_request_id and incoming.get("provider_request_id"):
++            self.provider_request_id = str(incoming["provider_request_id"])
++        if self.provider_request_id:
++            merged["provider_request_id"] = self.provider_request_id
++        self.billing_metadata = merged
++        if isinstance(response, dict) and isinstance(response.get("model"), str):
++            self.actual_model = response["model"]
++
+     @abstractmethod
+     async def generate(
+         self, 
+@@ -18,4 +53,4 @@ class BaseImageClient(ABC):
+         返回: (image_urls_list, status_message)
+         注意：传入的 model 应该是去掉供应商后缀的纯模型名（如 nano-banana-2）
+         """
+-        pass
+\ No newline at end of file
++        pass
+diff --git a/backend/app/services/image_generation/factory.py b/backend/app/services/image_generation/factory.py
+index 6800133..d3d33db 100644
+--- a/backend/app/services/image_generation/factory.py
++++ b/backend/app/services/image_generation/factory.py
+@@ -16,14 +16,11 @@ class ImageClientFactory:
+         """
+         根据供应商名称返回对应的实例。
+         """
+-        provider_key = provider_name.lower()
++        provider_key = str(provider_name or "zhenzhen").strip().lower()
+         client_builder = cls._registry.get(provider_key)
+-        
+         if not client_builder:
+-            print(f"⚠️ 未知供应商 '{provider_name}'，降级使用默认供应商 'zhenzhen'")
+-            client_builder = cls._registry["zhenzhen"]
+-            
+-        # 如果注册的是类本身，直接实例化；如果是 lambda，则调用执行
+-        if isinstance(client_builder, type):
+-            return client_builder()
+-        return client_builder()
+\ No newline at end of file
++            raise ValueError(f"不支持的图片供应商: {provider_name}")
++
++        client = client_builder()
++        client._reset_billing(provider=provider_key)
++        return client
+diff --git a/backend/app/services/image_generation/providers/volcengine.py b/backend/app/services/image_generation/providers/volcengine.py
+index fd72a21..4242498 100644
+--- a/backend/app/services/image_generation/providers/volcengine.py
++++ b/backend/app/services/image_generation/providers/volcengine.py
+@@ -5,6 +5,7 @@ from app.services.image_generation.utils import IMAGE_API_TIMEOUT
+ 
+ class VolcengineClient(BaseImageClient):
+     def __init__(self, is_po_xian: bool = False):
++        super().__init__(provider="poxian" if is_po_xian else "volcengine")
+         if is_po_xian:
+             env_base = settings.VOLCENGINE_POXIAN_API_BASE
+             self.api_key = settings.VOLCENGINE_POXIAN_API_KEY
+@@ -23,6 +24,7 @@ class VolcengineClient(BaseImageClient):
+         return "2048x2048"
+ 
+     async def generate(self, client: httpx.AsyncClient, prompt: str, model: str, aspect_ratio: str, image_size: str, image_urls=None, **kwargs):
++        self._reset_billing(model=model)
+         headers = {
+             "Content-Type": "application/json",
+             "Authorization": f"Bearer {self.api_key}"
+@@ -44,9 +46,12 @@ class VolcengineClient(BaseImageClient):
+             res = await client.post(self.base_url, headers=headers, json=payload)
+             res.raise_for_status()
+             result = res.json()
++            self._capture_billing(result)
+             urls = [item.get("url") for item in result.get("data", []) if item.get("url")]
+             if urls:
++                self.generation_succeeded = True
++                self.billing_metadata.setdefault("usage_json", {})["image_count"] = len(urls)
+                 return urls, "Success"
+-            return None, f"API Error: {result}"
++            return None, "供应商响应中未找到图片 URL，请联系管理员核对调用记录。"
+         except Exception as e:
+-            return None, f"Volcengine Error: {str(e)}"
+\ No newline at end of file
++            return None, f"Volcengine Error: {str(e)}"
+diff --git a/backend/app/services/image_generation/providers/zhenzhen.py b/backend/app/services/image_generation/providers/zhenzhen.py
+index 858a07c..d558870 100644
+--- a/backend/app/services/image_generation/providers/zhenzhen.py
++++ b/backend/app/services/image_generation/providers/zhenzhen.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import inspect
+ import httpx
+ from app.core.config import settings
+ from app.services.image_generation.base import BaseImageClient
+@@ -6,6 +7,7 @@ from app.services.image_generation.utils import _get_resolution_gpt_image
+ 
+ class ZhenZhenClient(BaseImageClient):
+     def __init__(self):
++        super().__init__(provider="zhenzhen")
+         base = (settings.ZHENZHEN_API_BASE or "https://ai.t8star.cn").rstrip("/")
+         if base.endswith("/v1"):
+             base = base[:-3].rstrip("/")
+@@ -59,6 +61,7 @@ class ZhenZhenClient(BaseImageClient):
+         return payload
+ 
+     async def generate(self, client: httpx.AsyncClient, prompt: str, model: str, aspect_ratio: str, image_size: str, image_urls=None, **kwargs):
++        self._reset_billing(model=model)
+         try:
+             # 1. 创建任务
+             actual_api_key = self._build_api_key(model)
+@@ -72,12 +75,24 @@ class ZhenZhenClient(BaseImageClient):
+                 timeout= self.timeout,
+             )
+             if res.status_code != 200:
+-                return None, {"code": "API_REQUEST_FAILED", "message": f"创建异步任务失败: {res.text}"}
++                return None, {"code": "API_REQUEST_FAILED", "message": f"创建异步任务失败（HTTP {res.status_code}）"}
+             
+-            task_id = res.json().get("task_id")
++            submitted = res.json()
++            task_id = submitted.get("task_id") or submitted.get("id")
+             if not task_id:
+                 return None, {"code": "MISSING_TASK_ID", "message": "接口未返回 task_id"}
+ 
++            self.provider_request_id = str(task_id)
++            self._capture_billing(submitted)
++            on_submitted = kwargs.get("on_submitted")
++            if on_submitted:
++                notified = on_submitted(
++                    provider_request_id=self.provider_request_id,
++                    metadata=dict(self.billing_metadata),
++                )
++                if inspect.isawaitable(notified):
++                    await notified
++
+             # 2. 轮询结果
+             max_attempts = 180 
+             for _ in range(max_attempts):
+@@ -85,18 +100,21 @@ class ZhenZhenClient(BaseImageClient):
+                 query_res = await client.get(f"{self.task_url_prefix}/{task_id}", headers = header, timeout=self.timeout)
+                 
+                 if query_res.status_code != 200:
+-                    return None, {"code": "QUERY_FAILED", "message": f"查询失败: {query_res.text}"}
++                    return None, {"code": "QUERY_FAILED", "message": f"查询失败（HTTP {query_res.status_code}）"}
+                 
+                 result = query_res.json()
++                self._capture_billing(result)
+                 outer_data = result.get("data", {})
+                 status = str(outer_data.get("status", "")).lower()
+ 
+                 if result.get("code") not in (None, "success"):
+-                    return None, {"code": "PLATFORM_EXCEPTION", "message": f"平台响应异常: {result}"}
++                    return None, {"code": "PLATFORM_EXCEPTION", "message": "供应商响应异常，请联系管理员核对调用记录。"}
+ 
+                 if status in ("success",):
++                    self.generation_succeeded = True
+                     urls = self._extract_urls(outer_data.get("data"))
+                     if urls:
++                        self.billing_metadata.setdefault("usage_json", {})["image_count"] = len(urls)
+                         # 成功时，也统一返回约定的格式
+                         return urls, {"code": "SUCCESS", "message": "Success"}
+                     return None, {"code": "NO_URL_PARSED", "message": "任务成功但未解析到图片URL"}
+@@ -126,4 +144,4 @@ class ZhenZhenClient(BaseImageClient):
+             for item in actual_data:
+                 if isinstance(item, dict) and item.get("url"):
+                     urls.append(item["url"])
+-        return urls
+\ No newline at end of file
++        return urls
+diff --git a/backend/app/services/image_service.py b/backend/app/services/image_service.py
+index 4f3b324..85c97b8 100644
+--- a/backend/app/services/image_service.py
++++ b/backend/app/services/image_service.py
+@@ -7,6 +7,7 @@ from app.models.domain import Task
+ from app.services.ai_utils import download_to_local
+ from app.services.image_generation.utils import IMAGE_API_TIMEOUT
+ from app.services.image_generation.factory import ImageClientFactory
++from app.services.billing import begin_call, update_call, finish_call
+ 
+ 
+ def _get_task(task_id: str):
+@@ -23,6 +24,7 @@ def _update_task(
+     status: str = None,
+     result_json=None,
+     error_message: str = None,
++    api_call_id: str = None,
+ ):
+     db = SessionLocal()
+     try:
+@@ -36,6 +38,8 @@ def _update_task(
+             task.result_json = result_json
+         if error_message is not None:
+             task.error_message = error_message
++        if api_call_id is not None:
++            task.api_call_id = api_call_id
+ 
+         db.commit()
+         db.refresh(task)
+@@ -56,6 +60,9 @@ async def process_image_task(task_id: str):
+     if not task:
+         return
+ 
++    call_id = None
++    upstream_finished = False
++    image_client = None
+     try:
+         # 1. 更新状态为运行中（短连接）
+         _update_task(task_id, status="running")
+@@ -77,6 +84,20 @@ async def process_image_task(task_id: str):
+         
+         # 3. 获取对应的生图客户端实例
+         image_client = ImageClientFactory.get_client(provider)
++        call_id = begin_call(
++            user_id=task.user_id,
++            project_id=project_id,
++            node_id=task.node_id,
++            task_id=task_id,
++            provider=image_client.actual_provider,
++            model=model,
++            call_type="image_generation",
++            parameters={"aspect_ratio": aspect_ratio, "image_size": image_size},
++        )
++        _update_task(task_id, api_call_id=call_id)
++
++        def on_submitted(*, provider_request_id=None, metadata=None):
++            update_call(call_id, provider_request_id=provider_request_id, metadata=metadata)
+ 
+         # 4. 调用生图接口 (直接透传 image_urls，不再下载图片)
+         async def _run_generation():
+@@ -88,6 +109,7 @@ async def process_image_task(task_id: str):
+                     aspect_ratio=aspect_ratio,
+                     image_size=image_size,
+                     image_urls=image_urls,  
++                    on_submitted=on_submitted,
+                 )
+ 
+         # 执行生图与超时控制
+@@ -95,7 +117,18 @@ async def process_image_task(task_id: str):
+             urls, result_msg = await asyncio.wait_for(_run_generation(), timeout=900)
+         except asyncio.TimeoutError:
+             urls = None
+-            result_msg = {"code": "SYSTEM_TIMEOUT", "message": "平台生成超时 (超过15分钟未响应)，已强行终止该任务。"}
++            result_msg = {"code": "SYSTEM_TIMEOUT", "message": "平台等待超时，上游任务可能仍在执行。"}
++
++        # Record the upstream outcome before local download. A download failure
++        # must not erase a generation that the supplier has already charged.
++        finish_call(
++            call_id,
++            status="success" if urls or image_client.generation_succeeded else "failed",
++            metadata=image_client.billing_metadata,
++            provider_request_id=image_client.provider_request_id,
++            error=None if urls else "Image generation did not return a usable result",
++        )
++        upstream_finished = True
+ 
+         # 失败处理：未拿到 URL，说明提前 return 了错误字典
+         if not urls:
+@@ -135,6 +168,14 @@ async def process_image_task(task_id: str):
+         )
+ 
+     except Exception as e:
++        if call_id and not upstream_finished:
++            finish_call(
++                call_id,
++                status="success" if getattr(image_client, "generation_succeeded", False) else "failed",
++                metadata=getattr(image_client, "billing_metadata", None),
++                provider_request_id=getattr(image_client, "provider_request_id", None),
++                error=type(e).__name__,
++            )
+         print(f"❌ 任务 {task_id} 执行发生未预期异常: {traceback.format_exc()}")
+         err_info = {"code": "INTERNAL_SERVER_ERROR", "message": f"系统内部错误: {str(e)}"}
+         _update_task(
+@@ -142,4 +183,4 @@ async def process_image_task(task_id: str):
+             status="failed",
+             result_json={"error": err_info},
+             error_message=err_info["message"],
+-        )
+\ No newline at end of file
++        )
+diff --git a/backend/app/services/video_generation/base.py b/backend/app/services/video_generation/base.py
+index 4a23a84..f4e05af 100644
+--- a/backend/app/services/video_generation/base.py
++++ b/backend/app/services/video_generation/base.py
+@@ -2,6 +2,41 @@ from abc import ABC, abstractmethod
+ import httpx
+ 
+ class BaseVideoClient(ABC):
++    def __init__(self, provider: str | None = None):
++        self._reset_billing(provider=provider)
++
++    def _reset_billing(self, *, provider: str | None = None, model: str | None = None):
++        """Metadata belongs to this generation, never to a shared class dictionary."""
++        self.actual_provider = provider or getattr(self, "actual_provider", None)
++        self.actual_model = model
++        self.provider_request_id = None
++        self.generation_succeeded = False
++        self.billing_metadata = {}
++
++    def _capture_billing(self, response):
++        from app.services.billing import extract_billing
++
++        incoming = extract_billing(response, provider=self.actual_provider)
++        previous = self.billing_metadata
++        merged = {**previous, **incoming}
++        merged["usage_json"] = {
++            **(previous.get("usage_json") or {}),
++            **(incoming.get("usage_json") or {}),
++        }
++        # A later polling response may omit a cost returned at submission time.
++        if incoming.get("cost") is None and previous.get("cost") is not None:
++            for key in ("cost", "currency", "cost_status"):
++                merged[key] = previous.get(key)
++        if not incoming.get("currency") and previous.get("currency"):
++            merged["currency"] = previous["currency"]
++        if not self.provider_request_id and incoming.get("provider_request_id"):
++            self.provider_request_id = str(incoming["provider_request_id"])
++        if self.provider_request_id:
++            merged["provider_request_id"] = self.provider_request_id
++        self.billing_metadata = merged
++        if isinstance(response, dict) and isinstance(response.get("model"), str):
++            self.actual_model = response["model"]
++
+     @abstractmethod
+     async def submit_task(self, client: httpx.AsyncClient, prompt: str, model: str, **kwargs):
+         """提交任务，返回 (task_id, message)"""
+@@ -17,4 +52,4 @@ class BaseVideoClient(ABC):
+ 
+     async def get_download_url(self, client: httpx.AsyncClient, result_data):
+         """默认直接返回 result_data (URL)，如有额外步骤(如MiniMax)则覆盖"""
+-        return result_data
+\ No newline at end of file
++        return result_data
+diff --git a/backend/app/services/video_generation/factory.py b/backend/app/services/video_generation/factory.py
+index 832aa9b..e08b69b 100644
+--- a/backend/app/services/video_generation/factory.py
++++ b/backend/app/services/video_generation/factory.py
+@@ -11,18 +11,19 @@ class ClientFactory:
+     @staticmethod
+     def get_client(provider: str) -> BaseVideoClient:
+         """根据前端传入的 provider 字段返回对应的客户端"""
+-        provider = provider.lower() if provider else ""
+-        
++        provider = str(provider or "").strip().lower()
++        provider = "ali" if provider == "aliyun" else provider
+         if provider == "minimax":
+-            return MiniMaxClient()
++            client = MiniMaxClient()
+         elif provider == "poxian":
+-            return VolcengineClient(is_po_xian=True)
++            client = VolcengineClient(is_po_xian=True)
+         elif provider == "volcengine":
+-            return VolcengineClient(is_po_xian=False)
++            client = VolcengineClient(is_po_xian=False)
+         elif provider == "zhenzhen":
+-            return ZhenZhenClient()
++            client = ZhenZhenClient()
+         elif provider == "ali":
+-            return AliClient()
++            client = AliClient()
+         else:
+-            # 兜底逻辑：如果没有匹配到，默认走火山普通版
+-            return VolcengineClient(is_po_xian=False)
+\ No newline at end of file
++            raise ValueError(f"不支持的视频供应商: {provider}")
++        client._reset_billing(provider=provider)
++        return client
+diff --git a/backend/app/services/video_generation/providers/volcengine.py b/backend/app/services/video_generation/providers/volcengine.py
+index 45a6ffe..c5afb07 100644
+--- a/backend/app/services/video_generation/providers/volcengine.py
++++ b/backend/app/services/video_generation/providers/volcengine.py
+@@ -4,6 +4,7 @@ from app.core.config import settings
+ 
+ class VolcengineClient(BaseVideoClient):
+     def __init__(self, is_po_xian):
++        super().__init__(provider="poxian" if is_po_xian else "volcengine")
+         api_version = "po_xian" if is_po_xian else "default"
+         self.api_key, self.base_url = self.get_api_details(api_version)
+ 
+@@ -21,6 +22,7 @@ class VolcengineClient(BaseVideoClient):
+         return api_key, base_url
+ 
+     async def submit_task(self, client: httpx.AsyncClient, prompt: str, model: str, **kwargs):
++        self._reset_billing(model=model)
+         headers = {
+             "Authorization": f"Bearer {self.api_key}",
+             "Content-Type": "application/json"
+@@ -98,15 +100,18 @@ class VolcengineClient(BaseVideoClient):
+         try:
+             response = await client.post(self.base_url, headers=headers, json=payload, timeout=60.0)
+             res_data = response.json()
++            self._capture_billing(res_data)
+             
+             # API 直接调用时，如果报错通常会返回 error 字段
+             if "error" in res_data:
+-                error_message = res_data.get("error", {}).get("message", str(res_data))
++                error_message = res_data.get("error", {}).get("message", "供应商请求失败")
+                 return None, f"Volcengine API 错误: {error_message}"
+                 
+             if "id" not in res_data:
+-                return None, f"Volc Error: 异常返回体 {res_data}"
++                return None, "Volc Error: 未解析到任务 ID，请联系管理员核对调用记录。"
+                 
++            self.provider_request_id = str(res_data["id"])
++            self._capture_billing(res_data)
+             return res_data["id"], "Success"
+         except Exception as e:
+             return None, f"HTTP 请求失败: {str(e)}"
+@@ -117,9 +122,11 @@ class VolcengineClient(BaseVideoClient):
+         try:
+             res = await client.get(url, headers=headers, timeout=30.0)
+             data = res.json()
++            self._capture_billing(data)
+             status = data.get("status")
+             
+             if status == "succeeded":
++                self.generation_succeeded = True
+                 if "content" in data and "video_url" in data["content"]:
+                     return "Success", data["content"]["video_url"]
+                 return "Failed", "No video_url in content"
+@@ -131,4 +138,4 @@ class VolcengineClient(BaseVideoClient):
+                 # 默认视作 "processing" 状态
+                 return "Processing", "生成中"
+         except Exception as e:
+-            return "Error", str(e)
+\ No newline at end of file
++            return "Error", str(e)
+diff --git a/backend/app/services/video_generation/providers/zhenzhen.py b/backend/app/services/video_generation/providers/zhenzhen.py
+index f9ccdc0..72c271a 100644
+--- a/backend/app/services/video_generation/providers/zhenzhen.py
++++ b/backend/app/services/video_generation/providers/zhenzhen.py
+@@ -5,6 +5,7 @@ from app.services.video_generation.base import BaseVideoClient
+ 
+ class ZhenZhenClient(BaseVideoClient):
+     def __init__(self):
++        super().__init__(provider="zhenzhen")
+         base = (settings.ZHENZHEN_API_BASE or "https://ai.t8star.cn").rstrip("/")
+         if base.endswith("/v1"):
+             base = base[:-3].rstrip("/")
+@@ -30,6 +31,7 @@ class ZhenZhenClient(BaseVideoClient):
+         """
+         提交任务，返回 (task_id, message) 或 (None, error_message)
+         """
++        self._reset_billing(model=model)
+         actual_api_key = self._build_api_key(model)
+         headers = self._build_headers(actual_api_key)
+ 
+@@ -88,16 +90,19 @@ class ZhenZhenClient(BaseVideoClient):
+         try:
+             response = await client.post(self.api_url, headers=headers, json=payload, timeout=60.0)
+             res_data = response.json()
++            self._capture_billing(res_data)
+ 
+             if response.status_code != 200:
+-                error_msg = res_data.get("error", {}).get("message", response.text)
++                error_msg = res_data.get("error", {}).get("message", "供应商请求失败")
+                 return None, f"API 错误 ({response.status_code}): {error_msg}"
+ 
+             # 兼容有些情况下叫 id，有些叫 task_id
+             task_id = res_data.get("id") or res_data.get("task_id")
+             if not task_id:
+-                return None, f"ZhenZhen Error: 异常返回体，未解析到任务 ID {res_data}"
++                return None, "ZhenZhen Error: 未解析到任务 ID，请联系管理员核对调用记录。"
+                 
++            self.provider_request_id = str(task_id)
++            self._capture_billing(res_data)
+             return str(task_id), "Success"
+ 
+         except Exception as e:
+@@ -120,10 +125,12 @@ class ZhenZhenClient(BaseVideoClient):
+                 return "Processing", f"查询延迟，状态码: {res.status_code}"
+                 
+             data = res.json()
++            self._capture_billing(data)
+             status = str(data.get("status", "")).lower()
+ 
+             # 解析成功状态
+             if status == "succeeded":
++                self.generation_succeeded = True
+                 content_data = data.get("content", {})
+                 video_url = content_data.get("video_url")
+                 if video_url:
+@@ -145,4 +152,4 @@ class ZhenZhenClient(BaseVideoClient):
+ 
+         except Exception as e:
+             # 查询接口偶发的异常，我们返回 Processing 增加系统容错性
+-            return "Processing", f"查询接口异常: {str(e)}"
+\ No newline at end of file
++            return "Processing", f"查询接口异常: {str(e)}"
+diff --git a/backend/app/services/video_service.py b/backend/app/services/video_service.py
+index 2e62b34..677e188 100644
+--- a/backend/app/services/video_service.py
++++ b/backend/app/services/video_service.py
+@@ -5,6 +5,7 @@ from app.core.database import SessionLocal
+ from app.models.domain import Task
+ from app.services.ai_utils import download_to_local
+ from app.services.video_generation.factory import ClientFactory
++from app.services.billing import begin_call, update_call, finish_call
+ 
+ 
+ def _get_task(task_id: str):
+@@ -21,6 +22,7 @@ def _update_task(
+     status: str = None,
+     result_json=None,
+     error_message: str = None,
++    api_call_id: str = None,
+ ):
+     db = SessionLocal()
+     try:
+@@ -34,6 +36,8 @@ def _update_task(
+             task.result_json = result_json
+         if error_message is not None:
+             task.error_message = error_message
++        if api_call_id is not None:
++            task.api_call_id = api_call_id
+ 
+         db.commit()
+         db.refresh(task)
+@@ -67,6 +71,9 @@ async def process_video_task(task_id: str):
+     if not task:
+         return
+ 
++    call_id = None
++    upstream_finished = False
++    video_client = None
+     try:
+         # 1. 初始化任务状态（短连接）
+         _update_task(task_id, status="running")
+@@ -76,10 +83,10 @@ async def process_video_task(task_id: str):
+         prompt = req.get("prompt")
+ 
+         raw_model = req.get("model", "doubao-seedance-1-5-pro-251215")
+-        parts = raw_model.split("-", 1)
+-        model = parts[1]
+-
+         provider = req.get("provider", "")
++        # The UI prefixes video model IDs with the provider. Preserve bare IDs.
++        prefix = f"{provider}-"
++        model = raw_model[len(prefix):] if provider and raw_model.startswith(prefix) else raw_model
+         resolution = req.get("resolution", "720p")
+         ratio = req.get("aspectRatio") or req.get("ratio") or "adaptive"
+         project_id = task.project_id
+@@ -128,6 +135,17 @@ async def process_video_task(task_id: str):
+         
+         # 5. 获取客户端
+         video_client = ClientFactory.get_client(provider)
++        call_id = begin_call(
++            user_id=task.user_id,
++            project_id=project_id,
++            node_id=task.node_id,
++            task_id=task_id,
++            provider=video_client.actual_provider,
++            model=model,
++            call_type="video_generation",
++            parameters={"duration": duration, "resolution": resolution, "ratio": ratio, "mode": final_mode},
++        )
++        _update_task(task_id, api_call_id=call_id)
+ 
+         async with httpx.AsyncClient(timeout=30.0) as client:
+             remote_task_id, msg = await video_client.submit_task(
+@@ -137,6 +155,13 @@ async def process_video_task(task_id: str):
+             if not remote_task_id:
+                 raise Exception(f"提交任务失败: {msg}") 
+ 
++            # Persist the supplier task ID as soon as submission succeeds.
++            update_call(
++                call_id,
++                provider_request_id=str(remote_task_id),
++                metadata=video_client.billing_metadata,
++            )
++
+             max_queue_seconds = 1800
+             max_process_seconds = 600
+             poll_interval = 5
+@@ -155,6 +180,13 @@ async def process_video_task(task_id: str):
+                 status, result_data = await video_client.query_status(client, remote_task_id)
+ 
+                 if status == "Success":
++                    finish_call(
++                        call_id,
++                        status="success",
++                        provider_request_id=str(remote_task_id),
++                        metadata=video_client.billing_metadata,
++                    )
++                    upstream_finished = True
+                     remote_video_url = await video_client.get_download_url(client, result_data)
+                     break
+ 
+@@ -168,7 +200,7 @@ async def process_video_task(task_id: str):
+ 
+                     queue_elapsed += poll_interval
+                     if queue_elapsed >= max_queue_seconds:
+-                        raise Exception(f"排队超时，已取消 (等候了 {queue_elapsed} 秒)")
++                        raise Exception(f"排队等待超时，上游任务可能仍在执行 (等候了 {queue_elapsed} 秒)")
+ 
+                     if queue_elapsed % 60 == 0:
+                         print(f"[Task {task_id}] [{model}] 排队中... 已耗时 {queue_elapsed} 秒")
+@@ -204,10 +236,18 @@ async def process_video_task(task_id: str):
+             )
+ 
+     except Exception as e:
++        if call_id and not upstream_finished:
++            finish_call(
++                call_id,
++                status="success" if getattr(video_client, "generation_succeeded", False) else "failed",
++                metadata=getattr(video_client, "billing_metadata", None),
++                provider_request_id=getattr(video_client, "provider_request_id", None),
++                error=type(e).__name__,
++            )
+         error_msg = f"视频生成失败: {str(e)}"
+         print(f"⚠️ [Task {task_id}] Failed: {error_msg}")
+         _update_task(
+             task_id,
+             status="failed",
+             error_message=error_msg,
+-        )
+\ No newline at end of file
++        )
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 63c3ff2..835c2ed 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -9,4 +9,7 @@ python-jose[cryptography]>=3.3.0
+ bcrypt>=4.0.0
+ Pillow>=10.0.0
+ alibabacloud-oss-v2>=1.2.4
+-httpx>=0.27.0
+\ No newline at end of file
++httpx>=0.27.0
++openai>=1.0.0
++alembic>=1.13.0
++python-dotenv>=1.0.0
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+new file mode 100644
+index 0000000..65109e1
+--- /dev/null
++++ b/backend/tests/conftest.py
+@@ -0,0 +1,10 @@
++"""Tests use disposable SQLite databases and dummy configuration, never real APIs."""
++import os
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++os.environ.setdefault("SECRET_KEY", "test-only-key-not-for-deployment")
++os.environ.setdefault("CORS_ORIGINS", "http://localhost")
++os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
++os.environ.setdefault("MEDIA_ROOT", "/tmp/canvas-test-media")
+diff --git a/backend/tests/test_agent_billing.py b/backend/tests/test_agent_billing.py
+new file mode 100644
+index 0000000..4be34e7
+--- /dev/null
++++ b/backend/tests/test_agent_billing.py
+@@ -0,0 +1,243 @@
++from contextvars import Context
++from types import SimpleNamespace
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from sqlalchemy import create_engine
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.api.endpoints import agent as agent_api
++from app.core.deps import get_current_user
++from app.models.domain import AgentConversation, Base, Project, User
++from app.repositories.conversation import ConversationRepository
++from app.services import billing
++from app.services.agent.llm import gateway as gateway_module
++from app.services.agent.llm.gateway import LLMCompletionRequest, OpenAICompatibleLLMGateway
++from app.services.agent.runtime import compaction, recovery
++
++
++@pytest.fixture
++def records(monkeypatch):
++    created, finished = [], []
++
++    def begin(**kwargs):
++        created.append(kwargs)
++        return f"call-{len(created)}"
++
++    def finish(call_id, **kwargs):
++        finished.append((call_id, kwargs))
++
++    monkeypatch.setattr(gateway_module, "begin_call", begin)
++    monkeypatch.setattr(gateway_module, "finish_call", finish)
++    return created, finished
++
++
++def make_gateway(create, **kwargs):
++    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
++    return OpenAICompatibleLLMGateway(client, provider="zhenzhen-gpt", **kwargs)
++
++
++def request():
++    return LLMCompletionRequest(model="test-model", messages=[{"role": "user", "content": "private"}], max_tokens=50)
++
++
++def test_complete_records_trusted_actor_and_original_response(records):
++    created, finished = records
++    response = {"id": "remote", "cost": "0.00012", "currency": "CNY"}
++    gateway = make_gateway(lambda **kwargs: response)
++    context = billing.BillingContext("actual-caller", "shared-project", conversation_id="conversation")
++    with billing.billing_context(context):
++        assert gateway.complete(request()) is response
++    assert created[0]["user_id"] == "actual-caller"
++    assert created[0]["project_id"] == "shared-project"
++    assert created[0]["conversation_id"] == "conversation"
++    assert created[0]["operation_id"] == context.operation_id
++    assert created[0]["provider"] == "zhenzhen-gpt"
++    assert "private" not in str(created)
++    assert finished == [("call-1", {"response": response})]
++    assert billing.current_billing_context.get() is None
++
++
++def test_retry_records_each_network_attempt_in_same_operation(records, monkeypatch):
++    created, finished = records
++    monkeypatch.setattr(recovery.time, "sleep", lambda _: None)
++    monkeypatch.setattr(recovery.settings, "AGENT_MAX_RETRIES", 1)
++
++    class RateLimited(Exception):
++        status_code = 429
++
++    attempts = []
++
++    def create(**kwargs):
++        attempts.append(kwargs)
++        if len(attempts) == 1:
++            raise RateLimited("rate limit")
++        return {"cost": "0.03"}
++
++    with billing.billing_context(billing.BillingContext("caller", "project")):
++        make_gateway(create).complete(request())
++    assert len(created) == 2
++    assert created[0]["operation_id"] == created[1]["operation_id"]
++    assert [row["parameters"]["attempt"] for row in created] == [1, 2]
++    assert finished[0] == ("call-1", {"status": "failed", "error": "RateLimited"})
++    assert finished[1] == ("call-2", {"response": {"cost": "0.03"}})
++
++
++class FakeStream:
++    def __init__(self, chunks):
++        self.chunks = chunks
++        self.closed = False
++
++    def __iter__(self):
++        yield from self.chunks
++
++    def close(self):
++        self.closed = True
++
++
++def test_stream_records_usage_only_chunk_and_does_not_duplicate_cost(records):
++    created, finished = records
++    stream = FakeStream([
++        {"id": "remote", "choices": [{"delta": {"content": "hello"}}]},
++        {"choices": [], "usage": {"input_tokens": 20, "output_tokens": 3}},
++        {"choices": [], "cost": "0.008", "currency": "CNY"},
++        {"choices": []},
++    ])
++    with billing.billing_context(billing.BillingContext("caller", "project")):
++        assert len(list(make_gateway(lambda **kwargs: stream).stream_complete(request()))) == 4
++    assert len(created) == len(finished) == 1
++    metadata = finished[0][1]["metadata"]
++    assert finished[0][1]["status"] == "success"
++    assert metadata["cost"] == "0.008"
++    assert metadata["currency"] == "CNY"
++    assert metadata["usage_json"] == {"input_tokens": 20, "output_tokens": 3}
++    assert metadata["provider_request_id"] == "remote"
++    assert stream.closed
++
++
++def test_stream_close_marks_interrupted_without_fabricating_zero(records):
++    _, finished = records
++    stream = FakeStream([{"choices": [{"delta": {"content": "hello"}}]}, {"cost": "8"}])
++    with billing.billing_context(billing.BillingContext("caller", "project")):
++        tracked = make_gateway(lambda **kwargs: stream).stream_complete(request())
++        next(tracked)
++        tracked.close()
++    assert stream.closed
++    assert finished[0][1]["status"] == "interrupted"
++    assert finished[0][1]["metadata"].get("cost") is None
++
++
++def test_unconsumed_stream_does_not_start_a_paid_request(records):
++    created, finished = records
++
++    def unexpected_request(**kwargs):
++        raise AssertionError("unconsumed stream must not send a request")
++
++    with billing.billing_context(billing.BillingContext("caller", "project")):
++        tracked = make_gateway(unexpected_request).stream_complete(request())
++        tracked.close()
++    assert created == finished == []
++
++
++def test_stream_failure_is_not_retried_after_content(records):
++    created, finished = records
++
++    class BrokenStream(FakeStream):
++        def __iter__(self):
++            yield {"choices": [{"delta": {"content": "partial"}}]}
++            raise ConnectionError("disconnected")
++
++    stream = BrokenStream([])
++    with billing.billing_context(billing.BillingContext("caller", "project")):
++        with pytest.raises(ConnectionError):
++            list(make_gateway(lambda **kwargs: stream).stream_complete(request()))
++    assert len(created) == 1
++    assert finished[0][1]["status"] == "failed"
++    assert finished[0][1]["error"] == "ConnectionError"
++    assert stream.closed
++
++
++def test_summary_is_metered_separately_under_current_actor(records, monkeypatch):
++    created, finished = records
++    response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))])
++    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
++    monkeypatch.setattr(compaction, "create_agent_client", lambda: client)
++    with billing.billing_context(billing.BillingContext("caller", "project")):
++        assert compaction.summarize_history([{"role": "user", "content": "private"}], "summary-model") == "summary"
++    assert created[0]["call_type"] == "history_summary"
++    assert created[0]["provider"] == "default"
++    assert created[0]["user_id"] == "caller"
++    assert finished[0][1]["response"] is response
++
++
++def test_sse_context_is_reset_between_next_calls_and_on_close():
++    actor = billing.BillingContext("caller", "project")
++    observed = []
++
++    def events():
++        try:
++            observed.append(billing.current_billing_context.get())
++            yield "first"
++            observed.append(billing.current_billing_context.get())
++            yield "second"
++        finally:
++            observed.append(billing.current_billing_context.get())
++
++    iterator = agent_api._billing_events(actor, events())
++    # A fresh Context per step mirrors sync SSE iteration in a thread pool.
++    assert Context().run(next, iterator) == "first"
++    assert billing.current_billing_context.get() is None
++    assert Context().run(next, iterator) == "second"
++    Context().run(iterator.close)
++    assert observed == [actor, actor, actor]
++    assert billing.current_billing_context.get() is None
++
++
++@pytest.fixture
++def agent_client():
++    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
++    Base.metadata.create_all(engine)
++    session = sessionmaker(bind=engine)()
++    caller = User(id="caller", username="caller", role="user")
++    session.add_all([
++        caller,
++        Project(id="other-project", name="Other", owner_id="other", share_enabled=True, share_token="valid-share", share_permission="edit"),
++        AgentConversation(id="conversation", project_id="other-project", created_by="other"),
++    ])
++    session.commit()
++    app = FastAPI()
++    app.include_router(agent_api.router, prefix="/api/agent")
++    app.dependency_overrides[get_current_user] = lambda: caller
++    app.dependency_overrides[agent_api.get_conversation_repo] = lambda: ConversationRepository(session)
++    app.dependency_overrides[agent_api.get_db] = lambda: session
++    with TestClient(app) as client:
++        yield client
++    session.close()
++    engine.dispose()
++
++
++@pytest.mark.parametrize("endpoint,payload", [
++    ("messages", {"content": "hello"}),
++    ("messages/stream", {"content": "hello"}),
++    ("tool-results", {"toolResults": []}),
++    ("tool-results/stream", {"toolResults": []}),
++])
++def test_paid_conversation_endpoints_reject_unrelated_project(agent_client, endpoint, payload):
++    response = agent_client.post(f"/api/agent/conversations/conversation/{endpoint}", json=payload)
++    assert response.status_code == 403
++
++
++def test_shared_conversation_access_checks_actual_share_token(agent_client):
++    assert agent_client.get("/api/agent/conversations/conversation").status_code == 403
++    assert agent_client.get(
++        "/api/agent/conversations/conversation", headers={"X-Project-Share-Token": "valid-share"},
++    ).status_code == 200
++
++
++def test_stateless_chat_also_checks_project_access_before_paid_call(agent_client):
++    response = agent_client.post("/api/agent/chat", json={
++        "projectId": "other-project", "messages": [{"role": "user", "content": "hello"}],
++    })
++    assert response.status_code == 403
+diff --git a/backend/tests/test_billing_api.py b/backend/tests/test_billing_api.py
+new file mode 100644
+index 0000000..45cf5c2
+--- /dev/null
++++ b/backend/tests/test_billing_api.py
+@@ -0,0 +1,146 @@
++from datetime import datetime
++import importlib.util
++from pathlib import Path
++
++import pytest
++from alembic.migration import MigrationContext
++from alembic.operations import Operations
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from sqlalchemy import create_engine, inspect, text
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.api.endpoints.billing import router
++from app.core.database import get_db
++from app.core.security import create_access_token
++from app.models.domain import APICall, Base, User
++
++
++@pytest.fixture
++def api():
++    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
++    Base.metadata.create_all(engine)
++    sessions = sessionmaker(bind=engine)
++    with sessions() as db:
++        db.add_all([
++            User(id="admin", username="admin", role="admin"),
++            User(id="member", username="member", role="user"),
++        ])
++        db.commit()
++    app = FastAPI()
++    app.include_router(router, prefix="/api/admin")
++
++    def override_db():
++        with sessions() as db:
++            yield db
++
++    app.dependency_overrides[get_db] = override_db
++    with TestClient(app) as client:
++        yield client, sessions
++    engine.dispose()
++
++
++def auth(user="admin"):
++    return {"Authorization": f"Bearer {create_access_token(data={'sub': user})}"}
++
++
++def add_call(sessions, **overrides):
++    defaults = dict(
++        id="call1", operation_id="op1", user_id="member", user_name="Member",
++        project_id="project1", project_name="Saved project", provider="zhenzhen",
++        model="image-model", call_type="image_generation", status="success",
++        cost="0.100000000000000001", currency="CNY", cost_status="reported",
++        started_at=datetime(2026, 10, 26, 16), completed_at=datetime(2026, 10, 26, 16, 0, 1),
++        duration_ms=1000, usage_json={"image_count": 1}, parameters_json={},
++    )
++    with sessions() as db:
++        db.add(APICall(**(defaults | overrides)))
++        db.commit()
++
++
++@pytest.mark.parametrize("path", ["/api/admin/api-calls", "/api/admin/api-calls/summary"])
++def test_admin_only_using_actual_login_dependency(api, path):
++    client, sessions = api
++    add_call(sessions)
++    assert client.get(path).status_code == 401
++    assert client.get(path, headers=auth("member")).status_code == 403
++    assert client.get(path, headers=auth()).status_code == 200
++    # The server checks the current database role, not a client-side flag.
++    with sessions() as db:
++        db.get(User, "admin").role = "user"
++        db.commit()
++    assert client.get(path, headers=auth()).status_code == 403
++
++
++def test_filter_pagination_and_inclusive_shanghai_dates(api):
++    client, sessions = api
++    add_call(sessions)
++    add_call(sessions, id="call2", started_at=datetime(2026, 10, 27, 15, 59, 59, 999999))
++    add_call(sessions, id="call3", started_at=datetime(2026, 10, 27, 16))
++    add_call(sessions, id="call4", started_at=datetime(2026, 10, 26, 15, 59, 59))
++    params = {"start_date": "2026-10-27", "end_date": "2026-10-27", "page_size": 1}
++    data = client.get("/api/admin/api-calls", params=params, headers=auth()).json()["data"]
++    assert data["total"] == 2
++    assert data["items"][0]["id"] == "call2"
++    assert data["items"][0]["cost"] == "0.100000000000000001"
++    assert data["items"][0]["started_at"].endswith("Z")
++    next_page = client.get("/api/admin/api-calls", params=params | {"page": 2}, headers=auth()).json()["data"]
++    assert next_page["items"][0]["id"] == "call1"
++    no_match = client.get("/api/admin/api-calls", params={"user_id": "other"}, headers=auth()).json()["data"]
++    assert no_match["total"] == 0
++
++
++def test_summary_preserves_precision_and_separates_units(api):
++    client, sessions = api
++    add_call(sessions)
++    add_call(sessions, id="call2", cost="0.200000000000000002")
++    add_call(sessions, id="call3", currency="USD", cost="2")
++    add_call(sessions, id="call4", currency=None, cost="3")
++    add_call(sessions, id="call5", provider="volcengine", currency=None, cost="4")
++    add_call(sessions, id="call6", provider="minimax", currency=None, cost=None, cost_status="not_supported")
++    add_call(sessions, id="call7", provider="volcengine", currency=None, cost=None, cost_status="unavailable")
++    add_call(sessions, id="call8", currency="CNY", cost="0")
++    result = client.get("/api/admin/api-calls/summary", headers=auth()).json()["data"]
++    totals = {(v["currency"], v["provider"]): v["cost"] for v in result["cost_totals"]}
++    assert totals == {("CNY", None): "0.300000000000000003", ("USD", None): "2", (None, "zhenzhen"): "3", (None, "volcengine"): "4"}
++    assert result["total_calls"] == 8
++    assert result["reported_cost_calls"] == 6
++    assert result["missing_cost_calls"] == 2
++    assert result["by_user"][0]["user_id"] == "member"
++    assert result["by_user"][0]["calls"] == 8
++
++
++def test_invalid_filters_and_limits_rejected(api):
++    client, _ = api
++    for params in ({"page": 0}, {"page_size": 101}, {"start_date": "bad"}, {"start_date": "2026-10-28", "end_date": "2026-10-27"}):
++        assert client.get("/api/admin/api-calls", params=params, headers=auth()).status_code == 422
++
++
++def test_empty_summary(api):
++    client, _ = api
++    data = client.get("/api/admin/api-calls/summary", headers=auth()).json()["data"]
++    assert data["total_calls"] == 0
++    assert data["cost_totals"] == []
++
++
++def test_migration_preserves_existing_tasks_and_supports_create_all_startup(tmp_path):
++    path = Path(__file__).parents[1] / "alembic/versions/b81e4a30c912_add_api_call_records.py"
++    spec = importlib.util.spec_from_file_location("billing_migration", path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    engine = create_engine(f"sqlite:///{tmp_path / 'migration.db'}")
++    with engine.begin() as connection:
++        connection.execute(text("CREATE TABLE tasks (id VARCHAR PRIMARY KEY, project_id VARCHAR)"))
++        connection.execute(text("INSERT INTO tasks (id, project_id) VALUES ('old-task', 'old-project')"))
++        # Existing application startup can create new tables before Alembic runs.
++        APICall.__table__.create(connection)
++        with Operations.context(MigrationContext.configure(connection)):
++            module.upgrade()
++            module.upgrade()
++        columns = {c["name"] for c in inspect(connection).get_columns("tasks")}
++        assert {"user_id", "api_call_id"} <= columns
++        row = connection.execute(text("SELECT id,user_id,api_call_id FROM tasks")).one()
++        assert tuple(row) == ("old-task", None, None)
++        assert "api_call_records" in inspect(connection).get_table_names()
++    engine.dispose()
+diff --git a/backend/tests/test_billing_service.py b/backend/tests/test_billing_service.py
+new file mode 100644
+index 0000000..48f49fe
+--- /dev/null
++++ b/backend/tests/test_billing_service.py
+@@ -0,0 +1,162 @@
++from decimal import Decimal
++
++import pytest
++from sqlalchemy import create_engine
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.models.domain import APICall, Base, Project, User
++from app.services import billing
++
++
++@pytest.fixture
++def billing_db(monkeypatch):
++    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
++    Base.metadata.create_all(engine)
++    sessions = sessionmaker(bind=engine)
++    monkeypatch.setattr(billing, "SessionLocal", sessions)
++    with sessions() as db:
++        db.add(User(id="caller", username="alice", display_name="Alice"))
++        db.add(Project(id="project", name="Film", owner_id="someone_else"))
++        db.commit()
++    yield sessions
++    engine.dispose()
++
++
++def start_call(**kwargs):
++    return billing.begin_call(
++        user_id="caller", project_id="project", provider=kwargs.pop("provider", "zhenzhen"),
++        model="test-model", call_type="image_generation", **kwargs,
++    )
++
++
++def test_extracts_nested_response_cost_without_inferring_currency():
++    result = billing.extract_billing({"data": {"data": {"cost": "0.0000001234567890123456789012345"}}}, "zhenzhen")
++    assert result["cost"] == "0.0000001234567890123456789012345"
++    assert result["currency"] is None
++    assert result["cost_status"] == "reported"
++
++
++def test_zero_is_reported_and_outermost_cost_wins():
++    result = billing.extract_billing({"cost": 0, "currency": "CNY", "usage": {"cost": 4}})
++    assert result["cost"] == "0"
++    assert result["cost_status"] == "reported"
++    assert result["currency"] == "CNY"
++
++
++@pytest.mark.parametrize("value", [None, True, False, "", "NaN", "Infinity", "-0.01", -4, "1e999999", "0e-999999", {"cost": 3}])
++def test_invalid_cost_is_not_zero(value):
++    result = billing.extract_billing({"cost": value})
++    assert result["cost"] is None
++    assert result["cost_status"] == "unavailable"
++
++
++@pytest.mark.parametrize("provider", ["minimax", "ali", "aliyun", "AliYun"])
++def test_deferred_providers_remain_null(provider):
++    result = billing.extract_billing({"cost": 5, "currency": "USD", "usage": {"total_tokens": 12}}, provider)
++    assert result["cost"] is None
++    assert result["currency"] is None
++    assert result["cost_status"] == "not_supported"
++    assert result["usage_json"] == {"total_tokens": 12}
++
++
++def test_response_content_is_never_searched_for_cost():
++    result = billing.extract_billing({
++        "choices": [{"message": {"content": {"cost": 100}}}],
++        "content": {"cost": 50},
++        "usage": {"total_tokens": 17, "api_key": "secret", "prompt": "private"},
++    })
++    assert result["cost"] is None
++    assert result["usage_json"] == {"total_tokens": 17}
++
++
++def test_sdk_responses_and_nested_details():
++    class Response:
++        def model_dump(self, **kwargs):
++            return {
++                "id": "provider-request",
++                "usage": {
++                    "cost": {"amount": Decimal("0.12"), "currency": "USD"},
++                    "prompt_tokens": 40,
++                    "prompt_tokens_details": {"cached_tokens": 10, "authorization": "private"},
++                },
++            }
++    result = billing.extract_billing(Response())
++    assert result["cost"] == "0.12"
++    assert result["currency"] == "USD"
++    assert result["provider_request_id"] == "provider-request"
++    assert result["usage_json"] == {"prompt_tokens": 40, "prompt_tokens_details": {"cached_tokens": 10}}
++
++
++def test_begin_snapshots_actual_caller_and_filters_parameters(billing_db):
++    call_id = start_call(parameters={"resolution": "1080p", "prompt": "private", "api_key": "secret"})
++    with billing_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.user_id == "caller"
++        assert row.user_name == "Alice"
++        assert row.project_name == "Film"
++        assert row.parameters_json == {"resolution": "1080p"}
++        assert row.cost is None
++        assert row.cost_status == "pending"
++
++
++def test_reported_cost_survives_later_missing_metadata_and_local_failure(billing_db):
++    call_id = start_call()
++    billing.update_call(call_id, provider_request_id="remote", metadata=billing.extract_billing({"cost": "0.45"}))
++    billing.finish_call(call_id, status="failed", response={"usage": {"total_tokens": 23}}, error="DownloadFailed")
++    with billing_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.cost == "0.45"
++        assert row.currency is None
++        assert row.cost_status == "reported"
++        assert row.status == "failed"
++        assert row.provider_request_id == "remote"
++        assert row.usage_json == {"total_tokens": 23}
++        assert row.completed_at is not None
++
++
++def test_finish_is_idempotent_and_allows_late_billing(billing_db):
++    call_id = start_call()
++    billing.finish_call(call_id, status="interrupted")
++    with billing_db() as db:
++        initial_time = db.get(APICall, call_id).completed_at
++    billing.finish_call(call_id, response={"cost": "0.07", "currency": "CNY"})
++    with billing_db() as db:
++        row = db.get(APICall, call_id)
++        assert db.query(APICall).count() == 1
++        assert row.cost == "0.07"
++        assert row.status == "interrupted"
++        assert row.completed_at == initial_time
++
++
++def test_unknown_finished_cost_stays_null(billing_db):
++    call_id = start_call()
++    billing.finish_call(call_id, response={"usage": {"input_tokens": 300}})
++    with billing_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.cost is None
++        assert row.cost_status == "unavailable"
++
++
++def test_deferred_provider_cannot_receive_cost_through_metadata(billing_db):
++    call_id = start_call(provider="ali")
++    billing.finish_call(call_id, metadata={"cost": "42", "currency": "USD", "cost_status": "reported"})
++    with billing_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.cost is None
++        assert row.currency is None
++        assert row.cost_status == "not_supported"
++
++
++def test_context_is_reset_after_failure_and_nested_scopes():
++    outer = billing.BillingContext("a", "project-a")
++    inner = billing.BillingContext("b", "project-b")
++    assert billing.current_billing_context.get() is None
++    with billing.billing_context(outer):
++        assert billing.current_billing_context.get() == outer
++        with pytest.raises(RuntimeError):
++            with billing.billing_context(inner):
++                assert billing.current_billing_context.get() == inner
++                raise RuntimeError("test")
++        assert billing.current_billing_context.get() == outer
++    assert billing.current_billing_context.get() is None
+diff --git a/backend/tests/test_generation_billing.py b/backend/tests/test_generation_billing.py
+new file mode 100644
+index 0000000..9d8fb5f
+--- /dev/null
++++ b/backend/tests/test_generation_billing.py
+@@ -0,0 +1,178 @@
++"""Generation accounting follows supplier completion, independently of downloads."""
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from sqlalchemy import create_engine
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.api.endpoints import image_tasks, video_tasks, tasks
++from app.core.database import get_db
++from app.core.deps import get_current_user
++from app.models.domain import Base, Project, Task, User
++from app.services import image_service, video_service
++
++
++def _task(task_type, provider="zhenzhen"):
++    return SimpleNamespace(
++        id="task-1", user_id="caller-1", project_id="project-1", node_id="node-1",
++        api_call_id=None, status="pending", task_type=task_type,
++        request_json={"provider": provider, "model": "zhenzhen-test-model", "prompt": "test", "mode": "multi_ref", "inputs": []},
++    )
++
++
++def _recording(monkeypatch, module, task, events):
++    class HTTPContext:
++        async def __aenter__(self):
++            return None
++
++        async def __aexit__(self, *args):
++            return None
++
++    def update_task(task_id, **values):
++        for key, value in values.items():
++            setattr(task, key, value)
++        events.append(("task", values))
++        return task
++
++    def begin(**values):
++        events.append(("begin", values))
++        return "call-1"
++
++    monkeypatch.setattr(module, "_get_task", lambda _: task)
++    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: HTTPContext())
++    monkeypatch.setattr(module, "_update_task", update_task)
++    monkeypatch.setattr(module, "begin_call", begin)
++    monkeypatch.setattr(module, "update_call", lambda call_id, **values: events.append(("update", values)))
++    monkeypatch.setattr(module, "finish_call", lambda call_id, **values: events.append(("finish", values)))
++
++
++def test_image_cost_recorded_before_failed_download(monkeypatch):
++    task = _task("image_generation")
++    events = []
++    _recording(monkeypatch, image_service, task, events)
++
++    class Client:
++        actual_provider = "zhenzhen"
++        billing_metadata = {}
++        provider_request_id = None
++        generation_succeeded = False
++
++        async def generate(self, **kwargs):
++            self.provider_request_id = "upstream-image-1"
++            kwargs["on_submitted"](provider_request_id=self.provider_request_id, metadata={})
++            self.billing_metadata = {"cost": "0.12", "currency": "CNY", "cost_status": "reported", "usage_json": {"images": 2}}
++            self.generation_succeeded = True
++            return ["https://example.test/first", "https://example.test/second"], "Success"
++
++    async def download(*args):
++        events.append(("download", {}))
++        raise RuntimeError("storage unavailable")
++
++    monkeypatch.setattr(image_service.ImageClientFactory, "get_client", lambda _: Client())
++    monkeypatch.setattr(image_service, "download_to_local", download)
++    asyncio.run(image_service.process_image_task(task.id))
++
++    finished = [values for event, values in events if event == "finish"]
++    assert len(finished) == 1
++    assert finished[0]["status"] == "success"
++    assert finished[0]["metadata"]["cost"] == "0.12"
++    assert next(i for i, item in enumerate(events) if item[0] == "finish") < next(i for i, item in enumerate(events) if item[0] == "download")
++    assert task.status == "failed"  # local failure must not reverse upstream accounting
++    assert task.api_call_id == "call-1"
++    assert events[1][0] == "begin"
++    assert events[1][1]["user_id"] == "caller-1"
++    assert any(event == "update" and values["provider_request_id"] == "upstream-image-1" for event, values in events)
++
++
++def test_video_polling_updates_one_call_and_preserves_cost_after_download_failure(monkeypatch):
++    task = _task("video_generation")
++    events = []
++    _recording(monkeypatch, video_service, task, events)
++
++    class Client:
++        actual_provider = "zhenzhen"
++        billing_metadata = {}
++        provider_request_id = None
++        generation_succeeded = False
++        polls = 0
++
++        async def submit_task(self, *args, **kwargs):
++            self.provider_request_id = "upstream-video-1"
++            return self.provider_request_id, "Success"
++
++        async def query_status(self, client, remote_id):
++            events.append(("poll", {}))
++            self.polls += 1
++            if self.polls == 1:
++                return "Processing", "running"
++            self.billing_metadata = {"cost": "1.23456789", "currency": "CNY", "cost_status": "reported"}
++            self.generation_succeeded = True
++            return "Success", "https://example.test/video"
++
++        async def get_download_url(self, client, result):
++            return result
++
++    async def download(*args):
++        raise RuntimeError("storage unavailable")
++
++    monkeypatch.setattr(video_service.ClientFactory, "get_client", lambda _: Client())
++    monkeypatch.setattr(video_service.asyncio, "sleep", AsyncMock())
++    monkeypatch.setattr(video_service, "download_to_local", download)
++    asyncio.run(video_service.process_video_task(task.id))
++
++    assert sum(event == "begin" for event, _ in events) == 1
++    assert sum(event == "poll" for event, _ in events) == 2
++    finished = [values for event, values in events if event == "finish"]
++    assert len(finished) == 1
++    assert finished[0]["metadata"]["cost"] == "1.23456789"
++    assert finished[0]["status"] == "success"
++    assert task.status == "failed"
++    assert next(i for i, item in enumerate(events) if item[0] == "update") < next(i for i, item in enumerate(events) if item[0] == "poll")
++
++
++@pytest.fixture
++def generation_api(monkeypatch):
++    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
++    Base.metadata.create_all(engine)
++    Session = sessionmaker(bind=engine)
++    db = Session()
++    owner = User(id="owner", username="owner")
++    caller = User(id="caller", username="caller")
++    project = Project(id="project", owner_id="owner", name="shared", share_enabled=True, share_token="valid-share", share_permission="edit")
++    db.add_all([owner, caller, project])
++    db.commit()
++
++    app = FastAPI()
++    app.include_router(image_tasks.router, prefix="/tasks")
++    app.include_router(video_tasks.router, prefix="/tasks")
++    app.include_router(tasks.router, prefix="/tasks")
++    app.dependency_overrides[get_db] = lambda: db
++    monkeypatch.setattr(image_tasks, "process_image_task", AsyncMock())
++    monkeypatch.setattr(video_tasks, "process_video_task", AsyncMock())
++    with TestClient(app) as client:
++        yield app, client, db, caller
++    db.close()
++    engine.dispose()
++
++
++@pytest.mark.parametrize("endpoint", ["image-generation", "video-generation"])
++def test_task_creation_requires_login_and_project_access(generation_api, endpoint):
++    app, client, db, caller = generation_api
++    payload = {"projectId": "project", "nodeId": "node", "prompt": "test", "user_id": "owner"}
++    assert client.post(f"/tasks/{endpoint}", json=payload).status_code == 401
++    app.dependency_overrides[get_current_user] = lambda: caller
++    assert client.post(f"/tasks/{endpoint}", json=payload).status_code == 403
++    response = client.post(f"/tasks/{endpoint}", json=payload, headers={"X-Project-Share-Token": "valid-share"})
++    assert response.status_code == 200
++    task = db.query(Task).filter(Task.id == response.json()["data"]["taskId"]).one()
++    assert task.user_id == "caller"
++    assert client.get(f"/tasks/{task.id}").status_code == 403
++    response = client.get(f"/tasks/{task.id}", headers={"X-Project-Share-Token": "valid-share"})
++    assert response.status_code == 200
++    assert "cost" not in response.json()["data"]
++    assert "api_call_id" not in response.json()["data"]
+diff --git a/backend/tests/test_provider_metadata.py b/backend/tests/test_provider_metadata.py
+new file mode 100644
+index 0000000..e0bc279
+--- /dev/null
++++ b/backend/tests/test_provider_metadata.py
+@@ -0,0 +1,140 @@
++"""Provider billing regression tests; all HTTP requests use an in-memory transport."""
++import os
++import unittest
++from unittest.mock import AsyncMock, patch
++
++os.environ.setdefault("SECRET_KEY", "provider-test-secret")
++os.environ.setdefault("CORS_ORIGINS", "http://localhost")
++os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
++os.environ.setdefault("MEDIA_ROOT", "/tmp/canvas-provider-tests")
++
++import httpx
++
++from app.core.config import settings
++from app.services.image_generation.providers.zhenzhen import ZhenZhenClient as ImageZhenZhen
++from app.services.image_generation.providers.volcengine import VolcengineClient as ImageVolcengine
++from app.services.video_generation.providers.zhenzhen import ZhenZhenClient as VideoZhenZhen
++from app.services.video_generation.providers.volcengine import VolcengineClient as VideoVolcengine
++from app.services.image_generation.factory import ImageClientFactory
++from app.services.video_generation.factory import ClientFactory
++
++
++class ProviderBillingTests(unittest.IsolatedAsyncioTestCase):
++    async def test_image_cost_comes_from_final_response_and_task_id_is_published_early(self):
++        submitted = []
++        events = []
++
++        def respond(request):
++            events.append(request.method)
++            if request.method == "POST":
++                return httpx.Response(200, json={"task_id": "image-upstream-1"})
++            self.assertEqual(submitted[0]["provider_request_id"], "image-upstream-1")
++            return httpx.Response(200, json={
++                "code": "success",
++                "data": {
++                    "status": "success", "cost": "0.025", "currency": "CNY",
++                    "data": {"data": [{"url": "https://example.invalid/1.png"},
++                                       {"url": "https://example.invalid/2.png"}]},
++                },
++            })
++
++        with patch.object(settings, "ZHENZHEN_API_KEY", "test-key"), patch(
++            "app.services.image_generation.providers.zhenzhen.asyncio.sleep", new_callable=AsyncMock
++        ):
++            provider = ImageZhenZhen()
++            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
++                urls, _ = await provider.generate(
++                    client, "test", "nano-banana-2", "1:1", "1K",
++                    on_submitted=lambda **values: submitted.append(values),
++                )
++
++        self.assertEqual(events, ["POST", "GET"])
++        self.assertEqual(len(urls), 2)
++        self.assertTrue(provider.generation_succeeded)
++        self.assertEqual(provider.billing_metadata["cost"], "0.025")
++        self.assertEqual(provider.billing_metadata["currency"], "CNY")
++        self.assertEqual(provider.billing_metadata["usage_json"]["image_count"], 2)
++
++    async def test_submitted_cost_survives_poll_response_that_omits_cost(self):
++        def respond(request):
++            if request.method == "POST":
++                return httpx.Response(200, json={
++                    "id": "video-upstream-1", "cost": "0.5", "currency": "CNY",
++                })
++            return httpx.Response(200, json={
++                "status": "succeeded",
++                "content": {"video_url": "https://example.invalid/video.mp4"},
++            })
++
++        with patch.object(settings, "ZHENZHEN_API_KEY", "test-key"):
++            provider = VideoZhenZhen()
++            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
++                task_id, _ = await provider.submit_task(client, "test", "seedance")
++                status, _ = await provider.query_status(client, task_id)
++
++        self.assertEqual(status, "Success")
++        self.assertTrue(provider.generation_succeeded)
++        self.assertEqual(provider.provider_request_id, "video-upstream-1")
++        self.assertEqual(provider.billing_metadata["cost"], "0.5")
++        self.assertEqual(provider.billing_metadata["cost_status"], "reported")
++
++    async def test_explicit_zero_cost_is_preserved_when_success_has_no_url(self):
++        def respond(request):
++            return httpx.Response(200, json={
++                "status": "succeeded", "cost": 0, "content": {},
++            })
++
++        with patch.object(settings, "ZHENZHEN_API_KEY", "test-key"):
++            provider = VideoZhenZhen()
++            async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
++                status, _ = await provider.query_status(client, "video-upstream-2")
++
++        self.assertEqual(status, "Failed")  # Delivery failed, upstream generation succeeded.
++        self.assertTrue(provider.generation_succeeded)
++        self.assertEqual(provider.billing_metadata["cost"], "0")
++
++    async def test_volcengine_missing_cost_remains_unknown_and_metadata_is_not_shared(self):
++        with patch.object(settings, "VOLCENGINE_API_BASE", "https://example.invalid/v3"), patch.object(
++            settings, "VOLCENGINE_API_KEY", "test-key"
++        ):
++            first = ImageVolcengine()
++            second = ImageVolcengine()
++            async with httpx.AsyncClient(transport=httpx.MockTransport(
++                lambda _: httpx.Response(200, json={
++                    "id": "image-upstream-2", "usage": {"total_tokens": 42},
++                    "data": [{"url": "https://example.invalid/image.png"}],
++                })
++            )) as client:
++                await first.generate(client, "test", "seedream", "1:1", "2K")
++
++        self.assertTrue(first.generation_succeeded)
++        self.assertIsNone(first.billing_metadata["cost"])
++        self.assertEqual(first.billing_metadata["usage_json"]["total_tokens"], 42)
++        self.assertEqual(second.billing_metadata, {})
++
++    def test_unknown_provider_does_not_silently_charge_a_different_supplier(self):
++        with self.assertRaises(ValueError):
++            ImageClientFactory.get_client("unknown")
++        with self.assertRaises(ValueError):
++            ClientFactory.get_client("unknown")
++
++    async def test_malformed_responses_keep_cost_out_of_user_facing_errors(self):
++        response = {"cost": "123.456789", "currency": "CNY", "status": "succeeded", "data": []}
++        with patch.object(settings, "ZHENZHEN_API_KEY", "test-key"), patch.object(
++            settings, "VOLCENGINE_API_BASE", "https://example.invalid/v3"
++        ), patch.object(settings, "VOLCENGINE_API_KEY", "test-key"):
++            async with httpx.AsyncClient(transport=httpx.MockTransport(
++                lambda _: httpx.Response(200, json=response)
++            )) as client:
++                image = ImageVolcengine()
++                _, message = await image.generate(client, "test", "seedream", "1:1", "2K")
++                self.assertNotIn("123.456789", str(message))
++                self.assertEqual(image.billing_metadata["cost"], "123.456789")
++                for provider in (VideoZhenZhen(), VideoVolcengine(is_po_xian=False)):
++                    _, message = await provider.submit_task(client, "test", "seedance")
++                    self.assertNotIn("123.456789", str(message))
++                    self.assertEqual(provider.billing_metadata["cost"], "123.456789")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index a6fbe85..bb16d14 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -3,7 +3,7 @@ import { Loader2 } from 'lucide-react';
+ import { authService } from './services/api';
+ import LoginScreen from './pages/LoginScreen';
+ //import Dashboard from './pages/Dashboard';
+-import Dashboard from './pages/Dashboard/dashboard';
++import Dashboard from './pages/Dashboard/Dashboard';
+ //import Workspace from './components/canvas/main-canvas/Workspace';
+ import TapnowCanvas from './components/canvas/TapnowCanvas';
+ 
+@@ -58,4 +58,4 @@ export default function App() {
+             )}
+         </div>
+     );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/components/canvas/TapnowCanvas.jsx b/frontend/src/components/canvas/TapnowCanvas.jsx
+index 8ed0903..b9b9f55 100644
+--- a/frontend/src/components/canvas/TapnowCanvas.jsx
++++ b/frontend/src/components/canvas/TapnowCanvas.jsx
+@@ -119,7 +119,7 @@ export default function TapnowCanvas({ user, projectId, onBack }) {
+ 
+   // 🛠️ 节点操作引擎 (负责创建节点、AI生成、打组等)
+   const { handleGroupSelection, handleBatchDownload, createNode, handleCreateFromEdge, handleGenerate, nodeActions } = useNodeOperations({
+-      projectId, containerRef, canvasWrapperRef,screenToCanvas, dispatchAndSave, updateNodeStrictAndSave, showToast,
++      projectId, shareToken, containerRef, canvasWrapperRef,screenToCanvas, dispatchAndSave, updateNodeStrictAndSave, showToast,
+       setSelection, setContextMenu, setEdgeMenu, setPreviewMedia, setVisiblePrompts, drawingNodeId, croppingNodeId,
+       setCroppingNodeId, setDrawingNodeId, setDragState, dragState,
+       isPickingCanvasImages: agentController.isPickingCanvasImages,
+@@ -806,4 +806,4 @@ export default function TapnowCanvas({ user, projectId, onBack }) {
+         />
+     </div>
+   );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx b/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
+index a20dd13..daa6747 100644
+--- a/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
++++ b/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
+@@ -11,7 +11,7 @@ import React, {
+ import { usePanelPosition } from './hooks/usePanelPosition';
+ import { useGenerationParams } from './hooks/useGenerationParams';
+ 
+-import { buildPresetPrompt } from '../../../utils/promptbuilder';
++import { buildPresetPrompt } from '../../../utils/promptBuilder';
+ import { getDimensionsByRatio } from '../../../utils/helpers';
+ 
+ import MentionTextarea from './components/MentionTextarea';
+@@ -691,4 +691,4 @@ export default function GenerationPanel({
+             </div>
+         </div>
+     );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/hooks/sync/useProjectData.js b/frontend/src/hooks/sync/useProjectData.js
+index 8bb9753..853d489 100644
+--- a/frontend/src/hooks/sync/useProjectData.js
++++ b/frontend/src/hooks/sync/useProjectData.js
+@@ -225,7 +225,7 @@ export function useProjectData(projectId, showToast, yjsInstances, shareToken) {
+         sharedYNodes,
+     ]);
+     // 开启轮询
+-    useTaskPolling(updateNodeStrictAndSave);
++    useTaskPolling(updateNodeStrictAndSave, shareToken);
+ 
+     return { isFirstLoad, isSaving, dispatchAndSave, updateNodeStrictAndSave, saveToCloud };
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/hooks/sync/useTaskPolling.js b/frontend/src/hooks/sync/useTaskPolling.js
+index 9557dcf..13ba721 100644
+--- a/frontend/src/hooks/sync/useTaskPolling.js
++++ b/frontend/src/hooks/sync/useTaskPolling.js
+@@ -3,7 +3,7 @@ import { taskService } from '../../services/api';
+ import { getMediaUrl, getImageDimensions,getVideoDimensions, calculateNodeSize } from '../../utils/helpers';
+ import useCanvasStore from '../../store/useCanvasStore';
+ 
+-export function useTaskPolling(updateNodeStrictAndSave) {
++export function useTaskPolling(updateNodeStrictAndSave, shareToken) {
+     const nodes = useCanvasStore(state => state.nodes);
+     const pendingTasksRef = useRef([]);
+ 
+@@ -18,7 +18,7 @@ export function useTaskPolling(updateNodeStrictAndSave) {
+ 
+             for (const node of pendingNodes) {
+                 try {
+-                    const status = await taskService.queryTaskStatus(node.taskId);
++                    const status = await taskService.queryTaskStatus(node.taskId, shareToken);
+                     console.log(`\n========================================`);
+                     console.log(`📥 [轮询数据] 任务 ${node.taskId} 后端完整返回:`, status);
+ 
+@@ -129,5 +129,5 @@ export function useTaskPolling(updateNodeStrictAndSave) {
+ 
+         const timer = setInterval(poll, 3000);
+         return () => clearInterval(timer);
+-    }, [updateNodeStrictAndSave]);
+-}
+\ No newline at end of file
++    }, [updateNodeStrictAndSave, shareToken]);
++}
+diff --git a/frontend/src/hooks/useNodeOperations.js b/frontend/src/hooks/useNodeOperations.js
+index 1b18ba6..75a9e65 100644
+--- a/frontend/src/hooks/useNodeOperations.js
++++ b/frontend/src/hooks/useNodeOperations.js
+@@ -7,7 +7,7 @@ import { CANVAS_CONFIG } from '../config/canvas.config';
+ import { getDimensionsByRatio } from '../utils/helpers';
+ 
+ export function useNodeOperations({
+-    projectId, containerRef, canvasWrapperRef,screenToCanvas,
++    projectId, shareToken, containerRef, canvasWrapperRef,screenToCanvas,
+     dispatchAndSave, updateNodeStrictAndSave, showToast,
+     setSelection, setDragState, setContextMenu, setEdgeMenu,
+     setPreviewMedia, setVisiblePrompts, drawingNodeId, croppingNodeId,
+@@ -184,13 +184,14 @@ export function useNodeOperations({
+         // 将脏活累活全部抛给纯函数处理
+         await aiGenerationService.submitTask({
+             projectId,
++            shareToken,
+             genParams,
+             canvasState,
+             updateNodeStrictAndSave,
+             pushHistory,
+             showToast
+         });
+-    }, [projectId, updateNodeStrictAndSave, pushHistory, showToast]);
++    }, [projectId, shareToken, updateNodeStrictAndSave, pushHistory, showToast]);
+ 
+     // ================= 4. 节点常规交互事件集合 =================
+     const nodeActions = useMemo(() => ({
+@@ -732,4 +733,4 @@ export function useNodeOperations({
+         ]);  
+         
+         return { handleGroupSelection, handleBatchDownload, createNode, handleCreateFromEdge, handleGenerate, nodeActions };
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/pages/Dashboard/components/ApiUsagePanel.jsx b/frontend/src/pages/Dashboard/components/ApiUsagePanel.jsx
+new file mode 100644
+index 0000000..038e5d3
+--- /dev/null
++++ b/frontend/src/pages/Dashboard/components/ApiUsagePanel.jsx
+@@ -0,0 +1,294 @@
++import { Fragment, useEffect, useRef, useState } from 'react';
++import { Activity, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Loader2, RefreshCw, Shield, X } from 'lucide-react';
++import { billingService } from '../../../services/api';
++
++const EMPTY_FILTERS = {
++    start_date: '', end_date: '', user_id: '', project_id: '', provider: '',
++    model: '', call_type: '', status: '', cost_status: '',
++};
++const PAGE_SIZE = 20;
++const CALL_TYPES = { image_generation: '图片生成', video_generation: '视频生成', agent_chat: 'Agent 对话', history_summary: '历史总结' };
++const STATUSES = { started: '进行中', success: '成功', failed: '失败', interrupted: '已中断' };
++const COST_STATUSES = { pending: '待获取', reported: '已返回', unavailable: '未返回', not_supported: '暂不采集' };
++const inputClass = 'w-full min-w-0 rounded-lg border border-white/10 bg-[#151515] px-3 py-2 text-sm text-neutral-200 outline-none focus:border-cyan-400/60 disabled:opacity-50';
++
++function decimalText(value) {
++    if (value === null || value === undefined) return '—';
++    const text = String(value);
++    if (!/^\d+(\.\d+)?$/.test(text)) return text;
++    const [whole, fraction] = text.split('.');
++    return `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${fraction ? `.${fraction}` : ''}`;
++}
++
++function unitLabel(total) {
++    return total.currency || `未标注单位${total.provider ? `（${total.provider}）` : ''}`;
++}
++
++function timeText(value) {
++    if (!value) return '—';
++    const date = new Date(value);
++    return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', {
++        timeZone: 'Asia/Shanghai', hour12: false,
++        year: 'numeric', month: '2-digit', day: '2-digit',
++        hour: '2-digit', minute: '2-digit', second: '2-digit',
++    });
++}
++
++function CostTotals({ totals, compact = false }) {
++    if (!totals?.length) return <span className="text-neutral-500">暂无已返回费用</span>;
++    return (
++        <div className={compact ? 'space-y-1 text-xs' : 'flex flex-wrap gap-3'}>
++            {totals.map((total, index) => (
++                <div key={`${total.currency}-${total.provider}-${index}`} className={compact ? '' : 'min-w-[175px] rounded-xl border border-cyan-400/15 bg-cyan-400/5 px-4 py-3'}>
++                    <span className={compact ? 'text-neutral-400' : 'block text-xs text-neutral-400'}>{unitLabel(total)}</span>
++                    <span className={compact ? 'ml-2 font-mono text-cyan-200' : 'mt-1 block break-all font-mono text-xl text-cyan-200'}>{decimalText(total.cost)}</span>
++                </div>
++            ))}
++        </div>
++    );
++}
++
++function SelectFilter({ label, name, value, options, onChange }) {
++    return (
++        <label className="min-w-0 space-y-1.5">
++            <span className="block text-xs text-neutral-400">{label}</span>
++            <select className={inputClass} name={name} value={value} onChange={onChange}>
++                <option value="">全部</option>
++                {options.map(option => (
++                    <option key={option.value} value={option.value}>{option.label}</option>
++                ))}
++            </select>
++        </label>
++    );
++}
++
++function RecordDetails({ record }) {
++    const details = [
++        ['调用编号', record.id], ['操作编号', record.operation_id],
++        ['用户编号', record.user_id], ['项目编号', record.project_id],
++        ['任务编号', record.task_id], ['节点编号', record.node_id],
++        ['会话编号', record.conversation_id], ['供应商请求编号', record.provider_request_id],
++        ['完成时间', timeText(record.completed_at)],
++        ['耗时', record.duration_ms == null ? '—' : `${(record.duration_ms / 1000).toFixed(2)} 秒`],
++    ];
++    return (
++        <div className="space-y-4 p-5 text-xs">
++            <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 xl:grid-cols-3">
++                {details.map(([label, value]) => (
++                    <div key={label} className="min-w-0">
++                        <dt className="text-neutral-500">{label}</dt>
++                        <dd className="mt-1 break-all font-mono text-neutral-300">{value || '—'}</dd>
++                    </div>
++                ))}
++            </dl>
++            <div className="grid gap-4 lg:grid-cols-2">
++                {[['用量与费用字段', record.usage_json], ['生成参数', record.parameters_json]].map(([label, data]) => (
++                    <div key={label} className="min-w-0">
++                        <div className="mb-2 text-neutral-500">{label}</div>
++                        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-white/5 bg-black/20 p-3 text-neutral-400">{data && Object.keys(data).length ? JSON.stringify(data, null, 2) : '暂无数据'}</pre>
++                    </div>
++                ))}
++            </div>
++            {record.error_message && <p className="break-all rounded-lg bg-red-400/5 p-3 text-red-300">{record.error_message}</p>}
++        </div>
++    );
++}
++
++function UsageDashboard({ onClose }) {
++    const [draft, setDraft] = useState(EMPTY_FILTERS);
++    const [filters, setFilters] = useState(EMPTY_FILTERS);
++    const [page, setPage] = useState(1);
++    const [revision, setRevision] = useState(0);
++    const [result, setResult] = useState({ items: [], total: 0 });
++    const [summary, setSummary] = useState(null);
++    const [loading, setLoading] = useState(true);
++    const [error, setError] = useState('');
++    const [expandedId, setExpandedId] = useState(null);
++    const dialogRef = useRef(null);
++    const closeRef = useRef(null);
++    const invalidDates = Boolean(draft.start_date && draft.end_date && draft.start_date > draft.end_date);
++
++    useEffect(() => {
++        let active = true;
++        Promise.all([
++            billingService.listCalls({ ...filters, page, page_size: PAGE_SIZE }),
++            billingService.getSummary(filters),
++        ]).then(([records, totals]) => {
++            if (!active) return;
++            setResult(records);
++            setSummary(totals);
++            setError('');
++        }).catch(err => {
++            if (active) setError(err.status === 403 ? '当前账号没有查看调用数据的权限。' : err.message || '加载数据失败，请重试。');
++        }).finally(() => {
++            if (active) setLoading(false);
++        });
++        return () => { active = false; };
++    }, [filters, page, revision]);
++
++    useEffect(() => {
++        const previousFocus = document.activeElement;
++        const previousOverflow = document.body.style.overflow;
++        document.body.style.overflow = 'hidden';
++        closeRef.current?.focus();
++        const onKeyDown = event => {
++            if (event.key === 'Escape') onClose();
++            if (event.key !== 'Tab') return;
++            const focusable = [...(dialogRef.current?.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex="0"]') || [])];
++            const first = focusable[0];
++            const last = focusable[focusable.length - 1];
++            if (event.shiftKey && document.activeElement === first) {
++                event.preventDefault(); last?.focus();
++            } else if (!event.shiftKey && document.activeElement === last) {
++                event.preventDefault(); first?.focus();
++            }
++        };
++        document.addEventListener('keydown', onKeyDown);
++        return () => {
++            document.removeEventListener('keydown', onKeyDown);
++            document.body.style.overflow = previousOverflow;
++            previousFocus?.focus?.();
++        };
++    }, [onClose]);
++
++    const changeFilter = event => {
++        const { name, value } = event.target;
++        setDraft(current => ({ ...current, [name]: value }));
++    };
++    const applyFilters = event => {
++        event.preventDefault();
++        if (invalidDates) return;
++        setLoading(true);
++        setError('');
++        setExpandedId(null);
++        setPage(1);
++        setFilters({ ...draft });
++    };
++    const resetFilters = () => {
++        setLoading(true);
++        setError('');
++        setDraft({ ...EMPTY_FILTERS });
++        setFilters({ ...EMPTY_FILTERS });
++        setExpandedId(null);
++        setPage(1);
++    };
++    const refresh = () => {
++        setLoading(true);
++        setError('');
++        setRevision(value => value + 1);
++    };
++    const changePage = next => {
++        setLoading(true);
++        setError('');
++        setExpandedId(null);
++        setPage(next);
++    };
++    const options = summary?.options || {};
++    const totalPages = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
++    const metrics = [
++        ['调用总数', summary?.total_calls], ['成功调用', summary?.success_calls],
++        ['已返回费用', summary?.reported_cost_calls], ['费用待获取 / 未采集', summary?.missing_cost_calls],
++    ];
++
++    return (
++        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-3 backdrop-blur-sm sm:p-6">
++            <section ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="api-usage-title" className="flex max-h-[94dvh] w-full max-w-[1500px] flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#191919] text-neutral-200 shadow-2xl">
++                <header className="flex shrink-0 items-center justify-between gap-3 border-b border-white/10 px-5 py-4 sm:px-7">
++                    <div className="flex min-w-0 items-center gap-3">
++                        <div className="rounded-xl bg-cyan-400/10 p-2.5 text-cyan-300"><Activity size={23} /></div>
++                        <div className="min-w-0">
++                            <h2 id="api-usage-title" className="text-lg font-semibold text-white">API 调用与费用</h2>
++                            <p className="mt-1 flex items-center gap-1.5 text-xs text-neutral-500"><Shield size={12} /> 管理员可见 · 时间按北京时间显示</p>
++                        </div>
++                    </div>
++                    <div className="flex items-center gap-2">
++                        <button type="button" onClick={refresh} disabled={loading} className="flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs text-neutral-300 hover:bg-white/5 disabled:opacity-40" title="刷新数据"><RefreshCw size={14} className={loading ? 'animate-spin' : ''} /><span className="hidden sm:inline">刷新</span></button>
++                        <button ref={closeRef} type="button" onClick={onClose} aria-label="关闭调用数据面板" className="rounded-lg p-2 text-neutral-400 hover:bg-white/5 hover:text-white"><X size={23} /></button>
++                    </div>
++                </header>
++
++                <div className="space-y-5 overflow-y-auto p-5 sm:p-7" aria-busy={loading}>
++                    <form onSubmit={applyFilters} className="rounded-xl border border-white/10 bg-black/10 p-4">
++                        <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
++                            <label className="space-y-1.5"><span className="block text-xs text-neutral-400">开始日期</span><input type="date" name="start_date" value={draft.start_date} onChange={changeFilter} className={`${inputClass} [color-scheme:dark]`} /></label>
++                            <label className="space-y-1.5"><span className="block text-xs text-neutral-400">结束日期（含当天）</span><input type="date" name="end_date" value={draft.end_date} onChange={changeFilter} className={`${inputClass} [color-scheme:dark]`} /></label>
++                            <SelectFilter label="调用用户" name="user_id" value={draft.user_id} options={(options.users || []).map(user => ({ value: user.id, label: user.name || user.id }))} onChange={changeFilter} />
++                            <SelectFilter label="所属项目" name="project_id" value={draft.project_id} options={(options.projects || []).map(project => ({ value: project.id, label: project.name || project.id }))} onChange={changeFilter} />
++                            <SelectFilter label="供应商" name="provider" value={draft.provider} options={(options.providers || []).map(provider => ({ value: provider, label: provider }))} onChange={changeFilter} />
++                            <SelectFilter label="模型" name="model" value={draft.model} options={(options.models || []).map(model => ({ value: model, label: model }))} onChange={changeFilter} />
++                            <SelectFilter label="调用类型" name="call_type" value={draft.call_type} options={Object.entries(CALL_TYPES).map(([value, label]) => ({ value, label }))} onChange={changeFilter} />
++                            <SelectFilter label="调用状态" name="status" value={draft.status} options={Object.entries(STATUSES).map(([value, label]) => ({ value, label }))} onChange={changeFilter} />
++                            <SelectFilter label="费用状态" name="cost_status" value={draft.cost_status} options={Object.entries(COST_STATUSES).map(([value, label]) => ({ value, label }))} onChange={changeFilter} />
++                            <div className="flex items-end gap-2"><button type="submit" disabled={invalidDates || loading} className="flex-1 rounded-lg bg-cyan-300 px-4 py-2 text-sm font-medium text-[#102125] hover:bg-cyan-200 disabled:opacity-40">查询</button><button type="button" onClick={resetFilters} disabled={loading} className="rounded-lg border border-white/10 px-3 py-2 text-sm text-neutral-400 hover:text-white disabled:opacity-40">重置</button></div>
++                        </div>
++                        {invalidDates && <p role="alert" className="mt-3 text-xs text-red-300">开始日期不能晚于结束日期。</p>}
++                    </form>
++
++                    {error ? (
++                        <div role="alert" className="rounded-xl border border-red-400/20 bg-red-400/5 p-5 text-sm text-red-300">{error}<button type="button" onClick={refresh} className="ml-4 underline underline-offset-4">重新加载</button></div>
++                    ) : loading ? (
++                        <div role="status" className="flex min-h-[300px] items-center justify-center gap-2 text-neutral-500"><Loader2 size={20} className="animate-spin" /> 正在加载调用数据…</div>
++                    ) : (
++                        <>
++                            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
++                                {metrics.map(([label, value]) => <div key={label} className="rounded-xl border border-white/10 bg-white/[0.02] px-5 py-4"><p className="text-xs text-neutral-500">{label}</p><p className="mt-2 text-2xl font-semibold tabular-nums text-white">{value ?? 0}</p></div>)}
++                            </div>
++
++                            <section className="space-y-3">
++                                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1"><h3 className="text-sm font-medium text-white">已返回费用合计</h3><p className="text-xs text-neutral-500">按供应商返回金额统计；不同单位分开汇总，空值不计为零。</p></div>
++                                <CostTotals totals={summary?.cost_totals} />
++                            </section>
++
++                            <div className="grid gap-4 lg:grid-cols-2">
++                                {[
++                                    { title: '按用户统计', rows: summary?.by_user || [], label: row => row.user_name || row.user_id || '未知用户', key: row => row.user_id || 'unknown' },
++                                    { title: '按模型统计', rows: summary?.by_model || [], label: row => `${row.model || '未知模型'} · ${row.provider || '未知供应商'}`, key: row => `${row.provider}-${row.model}` },
++                                ].map(group => (
++                                    <section key={group.title} className="rounded-xl border border-white/10 p-4">
++                                        <h3 className="mb-3 text-sm font-medium text-white">{group.title}</h3>
++                                        <div className="max-h-56 space-y-2 overflow-y-auto">
++                                            {group.rows.length ? group.rows.map(row => <div key={group.key(row)} className="flex items-start justify-between gap-4 rounded-lg bg-white/[0.02] px-3 py-2"><div className="min-w-0"><p className="break-all text-xs text-neutral-300">{group.label(row)}</p><p className="mt-1 text-xs text-neutral-600">{row.calls} 次调用</p></div><div className="shrink-0 text-right"><CostTotals totals={row.cost_totals} compact /></div></div>) : <p className="py-5 text-center text-xs text-neutral-500">暂无记录</p>}
++                                        </div>
++                                    </section>
++                                ))}
++                            </div>
++
++                            <section className="overflow-hidden rounded-xl border border-white/10">
++                                <div className="flex items-center justify-between border-b border-white/10 px-4 py-3"><h3 className="text-sm font-medium text-white">调用明细</h3><span className="text-xs text-neutral-500">共 {result.total} 条</span></div>
++                                <div className="overflow-x-auto">
++                                    <table className="w-full min-w-[1050px] text-left text-xs">
++                                        <thead className="bg-white/[0.03] text-neutral-500"><tr>{['调用时间', '用户 / 项目', '供应商 / 模型', '类型', '状态', '费用', ''].map((heading, index) => <th key={index} scope="col" className="px-4 py-3 font-medium">{heading}</th>)}</tr></thead>
++                                        <tbody className="divide-y divide-white/5">
++                                            {result.items.map(record => (
++                                                <Fragment key={record.id}>
++                                                    <tr className="align-top hover:bg-white/[0.02]">
++                                                        <td className="whitespace-nowrap px-4 py-4 text-neutral-400">{timeText(record.started_at)}</td>
++                                                        <td className="max-w-[210px] px-4 py-4"><p className="truncate text-neutral-200" title={record.user_name || record.user_id}>{record.user_name || record.user_id || '未知用户'}</p><p className="mt-1 truncate text-neutral-500" title={record.project_name || record.project_id}>{record.project_name || record.project_id || '未关联项目'}</p></td>
++                                                        <td className="max-w-[260px] px-4 py-4"><p className="text-neutral-400">{record.provider || '—'}</p><p className="mt-1 break-all text-neutral-300">{record.model || '—'}</p></td>
++                                                        <td className="whitespace-nowrap px-4 py-4 text-neutral-400">{CALL_TYPES[record.call_type] || record.call_type}</td>
++                                                        <td className="whitespace-nowrap px-4 py-4"><span className={`inline-block rounded-md px-2 py-1 ${record.status === 'success' ? 'bg-emerald-400/10 text-emerald-300' : record.status === 'failed' || record.status === 'interrupted' ? 'bg-red-400/10 text-red-300' : 'bg-amber-400/10 text-amber-300'}`}>{STATUSES[record.status] || record.status}</span></td>
++                                                        <td className="max-w-[220px] px-4 py-4">{record.cost == null ? <span className="text-neutral-500">{COST_STATUSES[record.cost_status] || '未返回'}</span> : <><p className="break-all font-mono text-cyan-200">{decimalText(record.cost)}</p><p className="mt-1 text-[11px] text-neutral-500">{unitLabel(record)}</p></>}</td>
++                                                        <td className="px-3 py-3"><button type="button" aria-expanded={expandedId === record.id} aria-label={`${expandedId === record.id ? '收起' : '查看'}调用 ${record.id} 的详情`} onClick={() => setExpandedId(current => current === record.id ? null : record.id)} className="rounded-lg p-2 text-neutral-500 hover:bg-white/5 hover:text-white">{expandedId === record.id ? <ChevronUp size={16} /> : <ChevronDown size={16} />}</button></td>
++                                                    </tr>
++                                                    {expandedId === record.id && <tr className="bg-black/15"><td colSpan={7}><RecordDetails record={record} /></td></tr>}
++                                                </Fragment>
++                                            ))}
++                                            {!result.items.length && <tr><td colSpan={7} className="py-16 text-center text-neutral-500">没有符合条件的调用记录。新调用完成后可刷新查看。</td></tr>}
++                                        </tbody>
++                                    </table>
++                                </div>
++                                <div className="flex items-center justify-between border-t border-white/10 px-4 py-3 text-xs text-neutral-500"><span>每页 {PAGE_SIZE} 条 · 第 {page} / {totalPages} 页</span><div className="flex gap-2"><button type="button" onClick={() => changePage(page - 1)} disabled={page <= 1} aria-label="上一页" className="rounded-lg border border-white/10 p-2 hover:text-white disabled:opacity-30"><ChevronLeft size={15} /></button><button type="button" onClick={() => changePage(page + 1)} disabled={page >= totalPages} aria-label="下一页" className="rounded-lg border border-white/10 p-2 hover:text-white disabled:opacity-30"><ChevronRight size={15} /></button></div></div>
++                            </section>
++                            <p className="text-xs leading-relaxed text-neutral-600">仅包含功能启用后记录的调用。MiniMax 与阿里云暂不采集费用；其他供应商未返回费用时保留空值。任务交付状态与供应商计费结果可能不同。</p>
++                        </>
++                    )}
++                </div>
++            </section>
++        </div>
++    );
++}
++
++export default function ApiUsagePanel({ currentUser, onClose }) {
++    if (currentUser?.role !== 'admin') return null;
++    return <UsageDashboard onClose={onClose} />;
++}
+diff --git a/frontend/src/pages/Dashboard/components/Sidebar.jsx b/frontend/src/pages/Dashboard/components/Sidebar.jsx
+index f871bf3..e37d641 100644
+--- a/frontend/src/pages/Dashboard/components/Sidebar.jsx
++++ b/frontend/src/pages/Dashboard/components/Sidebar.jsx
+@@ -1,10 +1,12 @@
+ // components/Sidebar.jsx
+ import React, { useState } from 'react';
+-import { LogOut, Settings, User as UserIcon, Shield, LayoutDashboard } from 'lucide-react';
++import { LogOut, Settings, User as UserIcon, Shield, LayoutDashboard, Activity } from 'lucide-react';
+ import UserManagementPage from './UserManagementPage'; 
++import ApiUsagePanel from './ApiUsagePanel';
+ 
+ export default function Sidebar({ currentUser, onLogout }) {
+     const [showUserModal, setShowUserModal] = useState(false);
++    const [showUsagePanel, setShowUsagePanel] = useState(false);
+ 
+     if (!currentUser) return null;
+     const isAdmin = currentUser.role === 'admin';
+@@ -44,6 +46,16 @@ export default function Sidebar({ currentUser, onLogout }) {
+                             项目空间
+                         </span>
+                     </button>
++                    {isAdmin && (
++                        <button
++                            onClick={() => setShowUsagePanel(true)}
++                            className="flex items-center w-full h-11 rounded-xl text-white/50 hover:text-white hover:bg-white/5 transition-colors overflow-hidden shrink-0"
++                            title="API 调用与费用"
++                        >
++                            <div className="w-[48px] flex items-center justify-center shrink-0"><Activity size={20} /></div>
++                            <span className="text-sm font-medium opacity-0 group-hover:opacity-100 whitespace-nowrap transition-opacity duration-300">调用与费用</span>
++                        </button>
++                    )}
+                 </div>
+ 
+                 {/* 3. 底部用户与操作区 */}
+@@ -99,12 +111,15 @@ export default function Sidebar({ currentUser, onLogout }) {
+             </aside>
+ 
+             {/* 管理弹窗 */}
+-            {showUserModal && (
++            {isAdmin && showUserModal && (
+                 <UserManagementPage
+                     currentUser={currentUser}
+                     onClose={() => setShowUserModal(false)}
+                 />
+             )}
++            {isAdmin && showUsagePanel && (
++                <ApiUsagePanel currentUser={currentUser} onClose={() => setShowUsagePanel(false)} />
++            )}
+         </>
+     );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/services/aiGenerationService.js b/frontend/src/services/aiGenerationService.js
+index 35185bb..3a8efd1 100644
+--- a/frontend/src/services/aiGenerationService.js
++++ b/frontend/src/services/aiGenerationService.js
+@@ -5,7 +5,7 @@ import { IMAGE_MODELS, VIDEO_MODELS } from '../config/constants';
+ const VALID_MEDIA_TYPES = ['picture', 'image'];
+ // 纯函数：不再依赖 React 环境的 state 和 hook
+ export const aiGenerationService = {
+-    async submitTask({ projectId, genParams, canvasState, updateNodeStrictAndSave, pushHistory, showToast }) {
++    async submitTask({ projectId, shareToken, genParams, canvasState, updateNodeStrictAndSave, pushHistory, showToast }) {
+         const generatorNode = canvasState.nodes.find(n => n.id === genParams.nodeId);
+         if (!generatorNode || generatorNode._isLoading) return;
+         
+@@ -54,8 +54,8 @@ export const aiGenerationService = {
+ 
+             const result = await (
+                 generatorNode.type === 'video' 
+-                ? taskService.createVideoTask(finalPayload) 
+-                : taskService.createImageTask(finalPayload)
++                ? taskService.createVideoTask(finalPayload, shareToken)
++                : taskService.createImageTask(finalPayload, shareToken)
+             );
+                 
+             if (!result || !result.taskId) {
+@@ -69,4 +69,4 @@ export const aiGenerationService = {
+             updateNodeStrictAndSave(generatorNode.id, { _isLoading: false, _error: err.message }); 
+         }
+     }
+-};
+\ No newline at end of file
++};
+diff --git a/frontend/src/services/api.js b/frontend/src/services/api.js
+index 05c057d..35e7304 100644
+--- a/frontend/src/services/api.js
++++ b/frontend/src/services/api.js
+@@ -69,9 +69,23 @@ export const mediaService = {
+ };
+ 
+ export const taskService = {
+-    createImageTask: (payload) => fetchApi('/api/tasks/image-generation', { method: 'POST', body: JSON.stringify(payload) }),
+-    createVideoTask: (payload) => fetchApi('/api/tasks/video-generation', { method: 'POST', body: JSON.stringify(payload) }),
+-    queryTaskStatus: (taskId) => fetchApi(`/api/tasks/${taskId}`)
++    createImageTask: (payload, shareToken) => fetchApi('/api/tasks/image-generation', { method: 'POST', body: JSON.stringify(payload), headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} }),
++    createVideoTask: (payload, shareToken) => fetchApi('/api/tasks/video-generation', { method: 'POST', body: JSON.stringify(payload), headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} }),
++    queryTaskStatus: (taskId, shareToken) => fetchApi(`/api/tasks/${taskId}`, { headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} })
++};
++
++const billingQuery = (filters = {}) => {
++    const params = new URLSearchParams();
++    Object.entries(filters).forEach(([key, value]) => {
++        if (value !== '' && value !== null && value !== undefined) params.set(key, String(value));
++    });
++    const query = params.toString();
++    return query ? `?${query}` : '';
++};
++
++export const billingService = {
++    listCalls: (filters) => fetchApi(`/api/admin/api-calls${billingQuery(filters)}`),
++    getSummary: (filters) => fetchApi(`/api/admin/api-calls/summary${billingQuery(filters)}`),
+ };
+ 
+ export const shareService = {

@@ -51,4 +51,7 @@ def create_agent_client(provider: str | None = None) -> OpenAI:
     return OpenAI(
         api_key=api_key,
         base_url=base_url,
+        # Application recovery owns retry attempts so each paid attempt can be
+        # recorded separately instead of being hidden inside the SDK.
+        max_retries=0,
     )

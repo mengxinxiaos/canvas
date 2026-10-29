@@ -16,14 +16,11 @@ class ImageClientFactory:
         """
         根据供应商名称返回对应的实例。
         """
-        provider_key = provider_name.lower()
+        provider_key = str(provider_name or "zhenzhen").strip().lower()
         client_builder = cls._registry.get(provider_key)
-        
         if not client_builder:
-            print(f"⚠️ 未知供应商 '{provider_name}'，降级使用默认供应商 'zhenzhen'")
-            client_builder = cls._registry["zhenzhen"]
-            
-        # 如果注册的是类本身，直接实例化；如果是 lambda，则调用执行
-        if isinstance(client_builder, type):
-            return client_builder()
-        return client_builder()
+            raise ValueError(f"不支持的图片供应商: {provider_name}")
+
+        client = client_builder()
+        client._reset_billing(provider=provider_key)
+        return client

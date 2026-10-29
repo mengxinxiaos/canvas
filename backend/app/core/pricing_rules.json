@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "version": "2026-10-27.v1",
+  "source": "user_config",
+  "rules": [
+    {
+      "id": "zhenzhen-rmb-multiplier-v1",
+      "kind": "provider_multiplier",
+      "providers": ["zhenzhen", "zhenzhen-gpt", "zhenzhen-gemini"],
+      "multiplier": "1.35",
+      "currency": "CNY"
+    },
+    {
+      "id": "seedance-2.0-video-token-v1",
+      "kind": "token_rate",
+      "providers": ["volcengine", "poxian"],
+      "call_types": ["video_generation"],
+      "model_patterns": ["^(?:doubao-)?seedance-2-0(?:-[0-9]{6}|-[0-9]{8})?$"],
+      "model_aliases": {
+        "poxian": ["ep-20260414170324-klrk5"]
+      },
+      "token_unit": "1000000",
+      "currency": "CNY",
+      "rates": {
+        "without_video": {"480p": "46", "720p": "46", "1080p": "51", "4k": "26"},
+        "with_video": {"480p": "28", "720p": "28", "1080p": "31", "4k": "16"}
+      }
+    }
+  ]
+}

@@ -7,6 +7,7 @@ from app.models.domain import Task
 from app.services.ai_utils import download_to_local
 from app.services.image_generation.utils import IMAGE_API_TIMEOUT
 from app.services.image_generation.factory import ImageClientFactory
+from app.services.billing import begin_call, update_call, finish_call
 
 
 def _get_task(task_id: str):
@@ -23,6 +24,7 @@ def _update_task(
     status: str = None,
     result_json=None,
     error_message: str = None,
+    api_call_id: str = None,
 ):
     db = SessionLocal()
     try:
@@ -36,6 +38,8 @@ def _update_task(
             task.result_json = result_json
         if error_message is not None:
             task.error_message = error_message
+        if api_call_id is not None:
+            task.api_call_id = api_call_id
 
         db.commit()
         db.refresh(task)
@@ -56,6 +60,9 @@ async def process_image_task(task_id: str):
     if not task:
         return
 
+    call_id = None
+    upstream_finished = False
+    image_client = None
     try:
         # 1. 更新状态为运行中（短连接）
         _update_task(task_id, status="running")
@@ -77,6 +84,20 @@ async def process_image_task(task_id: str):
         
         # 3. 获取对应的生图客户端实例
         image_client = ImageClientFactory.get_client(provider)
+        call_id = begin_call(
+            user_id=task.user_id,
+            project_id=project_id,
+            node_id=task.node_id,
+            task_id=task_id,
+            provider=image_client.actual_provider,
+            model=model,
+            call_type="image_generation",
+            parameters={"aspect_ratio": aspect_ratio, "image_size": image_size},
+        )
+        _update_task(task_id, api_call_id=call_id)
+
+        def on_submitted(*, provider_request_id=None, metadata=None):
+            update_call(call_id, provider_request_id=provider_request_id, metadata=metadata)
 
         # 4. 调用生图接口 (直接透传 image_urls，不再下载图片)
         async def _run_generation():
@@ -88,6 +109,7 @@ async def process_image_task(task_id: str):
                     aspect_ratio=aspect_ratio,
                     image_size=image_size,
                     image_urls=image_urls,  
+                    on_submitted=on_submitted,
                 )
 
         # 执行生图与超时控制
@@ -95,7 +117,18 @@ async def process_image_task(task_id: str):
             urls, result_msg = await asyncio.wait_for(_run_generation(), timeout=900)
         except asyncio.TimeoutError:
             urls = None
-            result_msg = {"code": "SYSTEM_TIMEOUT", "message": "平台生成超时 (超过15分钟未响应)，已强行终止该任务。"}
+            result_msg = {"code": "SYSTEM_TIMEOUT", "message": "平台等待超时，上游任务可能仍在执行。"}
+
+        # Record the upstream outcome before local download. A download failure
+        # must not erase a generation that the supplier has already charged.
+        finish_call(
+            call_id,
+            status="success" if urls or image_client.generation_succeeded else "failed",
+            metadata=image_client.billing_metadata,
+            provider_request_id=image_client.provider_request_id,
+            error=None if urls else "Image generation did not return a usable result",
+        )
+        upstream_finished = True
 
         # 失败处理：未拿到 URL，说明提前 return 了错误字典
         if not urls:
@@ -135,6 +168,14 @@ async def process_image_task(task_id: str):
         )
 
     except Exception as e:
+        if call_id and not upstream_finished:
+            finish_call(
+                call_id,
+                status="success" if getattr(image_client, "generation_succeeded", False) else "failed",
+                metadata=getattr(image_client, "billing_metadata", None),
+                provider_request_id=getattr(image_client, "provider_request_id", None),
+                error=type(e).__name__,
+            )
         print(f"❌ 任务 {task_id} 执行发生未预期异常: {traceback.format_exc()}")
         err_info = {"code": "INTERNAL_SERVER_ERROR", "message": f"系统内部错误: {str(e)}"}
         _update_task(

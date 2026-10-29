@@ -119,7 +119,7 @@ export default function TapnowCanvas({ user, projectId, onBack }) {
 
   // 🛠️ 节点操作引擎 (负责创建节点、AI生成、打组等)
   const { handleGroupSelection, handleBatchDownload, createNode, handleCreateFromEdge, handleGenerate, nodeActions } = useNodeOperations({
-      projectId, containerRef, canvasWrapperRef,screenToCanvas, dispatchAndSave, updateNodeStrictAndSave, showToast,
+      projectId, shareToken, containerRef, canvasWrapperRef,screenToCanvas, dispatchAndSave, updateNodeStrictAndSave, showToast,
       setSelection, setContextMenu, setEdgeMenu, setPreviewMedia, setVisiblePrompts, drawingNodeId, croppingNodeId,
       setCroppingNodeId, setDrawingNodeId, setDragState, dragState,
       isPickingCanvasImages: agentController.isPickingCanvasImages,

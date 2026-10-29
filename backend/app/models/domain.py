@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Text,Boolean
+from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Text,Boolean, Index
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
 import uuid
@@ -53,6 +53,50 @@ class Task(Base):
     status = Column(String, default="pending")
     request_json = Column(JSON, nullable=True)
     result_json = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    user_id = Column(String, nullable=True)
+    api_call_id = Column(String, nullable=True)
+
+
+class APICall(Base):
+    """Provider evidence and frozen pricing, retained after project/message deletion.
+
+    Decimal amounts are stored as text to preserve provider precision in SQLite.
+    Raw supplier costs and locally calculated amounts are stored separately.
+    """
+    __tablename__ = "api_call_records"
+    __table_args__ = (
+        Index("ix_api_calls_started_id", "started_at", "id"),
+        Index("ix_api_calls_user_started", "user_id", "started_at"),
+        Index("ix_api_calls_project_started", "project_id", "started_at"),
+    )
+
+    id = Column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    operation_id = Column(String, nullable=False, index=True)
+    user_id = Column(String, nullable=True)
+    user_name = Column(String, nullable=True)
+    project_id = Column(String, nullable=True)
+    project_name = Column(String, nullable=True)
+    node_id = Column(String, nullable=True)
+    task_id = Column(String, nullable=True)
+    conversation_id = Column(String, nullable=True)
+    call_type = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    cost = Column(Text, nullable=True)
+    currency = Column(String, nullable=True)
+    cost_status = Column(String, nullable=False, default="pending")
+    provider_cost = Column(Text, nullable=True)
+    provider_currency = Column(String, nullable=True)
+    billing_model = Column(String, nullable=True)
+    pricing_snapshot = Column(JSON, nullable=True)
+    usage_json = Column(JSON, nullable=True)
+    provider_request_id = Column(String, nullable=True)
+    parameters_json = Column(JSON, nullable=True)
+    started_at = Column(DateTime, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
 
 class AgentConversation(Base):

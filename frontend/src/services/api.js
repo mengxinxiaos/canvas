@@ -69,9 +69,23 @@ export const mediaService = {
 };
 
 export const taskService = {
-    createImageTask: (payload) => fetchApi('/api/tasks/image-generation', { method: 'POST', body: JSON.stringify(payload) }),
-    createVideoTask: (payload) => fetchApi('/api/tasks/video-generation', { method: 'POST', body: JSON.stringify(payload) }),
-    queryTaskStatus: (taskId) => fetchApi(`/api/tasks/${taskId}`)
+    createImageTask: (payload, shareToken) => fetchApi('/api/tasks/image-generation', { method: 'POST', body: JSON.stringify(payload), headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} }),
+    createVideoTask: (payload, shareToken) => fetchApi('/api/tasks/video-generation', { method: 'POST', body: JSON.stringify(payload), headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} }),
+    queryTaskStatus: (taskId, shareToken) => fetchApi(`/api/tasks/${taskId}`, { headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} })
+};
+
+const billingQuery = (filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+        if (value !== '' && value !== null && value !== undefined) params.set(key, String(value));
+    });
+    const query = params.toString();
+    return query ? `?${query}` : '';
+};
+
+export const billingService = {
+    listCalls: (filters) => fetchApi(`/api/admin/api-calls${billingQuery(filters)}`),
+    getSummary: (filters) => fetchApi(`/api/admin/api-calls/summary${billingQuery(filters)}`),
 };
 
 export const shareService = {

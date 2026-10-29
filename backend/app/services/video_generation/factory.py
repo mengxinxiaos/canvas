@@ -11,18 +11,19 @@ class ClientFactory:
     @staticmethod
     def get_client(provider: str) -> BaseVideoClient:
         """根据前端传入的 provider 字段返回对应的客户端"""
-        provider = provider.lower() if provider else ""
-        
+        provider = str(provider or "").strip().lower()
+        provider = "ali" if provider == "aliyun" else provider
         if provider == "minimax":
-            return MiniMaxClient()
+            client = MiniMaxClient()
         elif provider == "poxian":
-            return VolcengineClient(is_po_xian=True)
+            client = VolcengineClient(is_po_xian=True)
         elif provider == "volcengine":
-            return VolcengineClient(is_po_xian=False)
+            client = VolcengineClient(is_po_xian=False)
         elif provider == "zhenzhen":
-            return ZhenZhenClient()
+            client = ZhenZhenClient()
         elif provider == "ali":
-            return AliClient()
+            client = AliClient()
         else:
-            # 兜底逻辑：如果没有匹配到，默认走火山普通版
-            return VolcengineClient(is_po_xian=False)
+            raise ValueError(f"不支持的视频供应商: {provider}")
+        client._reset_billing(provider=provider)
+        return client

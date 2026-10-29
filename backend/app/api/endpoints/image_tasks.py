@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, Header
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from app.core.database import get_db
-from app.models.domain import Task
+from app.models.domain import Task, User
+from app.core.deps import get_current_user
+from app.services.project_access import ProjectAccessPolicy
 # 假设这里引入的是我们上一步重构好的异步核心逻辑
 from app.services.image_service import process_image_task 
 
@@ -26,10 +28,16 @@ class ImageTaskRequest(BaseModel):
 def create_image_task(
     req: ImageTaskRequest, 
     background_tasks: BackgroundTasks, 
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
 ):
+    ProjectAccessPolicy(db).assert_can_edit(
+        project_id=req.projectId, current_user=current_user, share_token=share_token,
+    )
     # 1. 创建并保存任务记录 (Pending 状态)
     t = Task(
+        user_id=current_user.id,
         project_id=req.projectId,
         node_id=req.nodeId,
         task_type="image_generation", 

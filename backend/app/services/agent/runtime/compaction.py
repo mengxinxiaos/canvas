@@ -3,7 +3,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.services.agent.llm.client_factory import create_agent_client
-from app.services.agent.runtime.recovery import RecoveryState, with_retry
+from app.services.agent.llm.gateway import LLMCompletionRequest, OpenAICompatibleLLMGateway
 
 
 def message_text(msg: dict[str, Any]) -> str:
@@ -131,19 +131,17 @@ def summarize_history(messages: list[dict[str, Any]], model: str) -> str:
         f"Conversation JSON:\n{conversation}"
     )
 
-    state = RecoveryState(current_model=model)
-
-    def call_llm():
-        return client.chat.completions.create(
-            model=state.current_model,
+    gateway = OpenAICompatibleLLMGateway(client, provider="default", call_type="history_summary")
+    resp = gateway.complete(
+        LLMCompletionRequest(
+            model=model,
             messages=[
                 {"role": "system", "content": "你负责总结 Agent 对话状态。只输出总结文本，不要调用工具。"},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=2000,
         )
-
-    resp = with_retry(call_llm, state)
+    )
     return (resp.choices[0].message.content or "").strip() or "(empty summary)"
 
 

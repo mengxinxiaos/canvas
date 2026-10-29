@@ -5,6 +5,7 @@ from app.services.video_generation.base import BaseVideoClient
 
 class ZhenZhenClient(BaseVideoClient):
     def __init__(self):
+        super().__init__(provider="zhenzhen")
         base = (settings.ZHENZHEN_API_BASE or "https://ai.t8star.cn").rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3].rstrip("/")
@@ -30,6 +31,7 @@ class ZhenZhenClient(BaseVideoClient):
         """
         提交任务，返回 (task_id, message) 或 (None, error_message)
         """
+        self._reset_billing(model=model)
         actual_api_key = self._build_api_key(model)
         headers = self._build_headers(actual_api_key)
 
@@ -79,6 +81,7 @@ class ZhenZhenClient(BaseVideoClient):
             "duration": int(kwargs.get("duration", 5)),
             "watermark": False
         }
+        self._capture_submission_parameters(payload)
         
         #web_search = kwargs.get('web_search', False)
         #if web_search and 'seedance-2-0' in model_alias:
@@ -88,16 +91,19 @@ class ZhenZhenClient(BaseVideoClient):
         try:
             response = await client.post(self.api_url, headers=headers, json=payload, timeout=60.0)
             res_data = response.json()
+            self._capture_billing(res_data)
 
             if response.status_code != 200:
-                error_msg = res_data.get("error", {}).get("message", response.text)
+                error_msg = res_data.get("error", {}).get("message", "供应商请求失败")
                 return None, f"API 错误 ({response.status_code}): {error_msg}"
 
             # 兼容有些情况下叫 id，有些叫 task_id
             task_id = res_data.get("id") or res_data.get("task_id")
             if not task_id:
-                return None, f"ZhenZhen Error: 异常返回体，未解析到任务 ID {res_data}"
+                return None, "ZhenZhen Error: 未解析到任务 ID，请联系管理员核对调用记录。"
                 
+            self.provider_request_id = str(task_id)
+            self._capture_billing(res_data)
             return str(task_id), "Success"
 
         except Exception as e:
@@ -120,10 +126,12 @@ class ZhenZhenClient(BaseVideoClient):
                 return "Processing", f"查询延迟，状态码: {res.status_code}"
                 
             data = res.json()
+            self._capture_billing(data)
             status = str(data.get("status", "")).lower()
 
             # 解析成功状态
             if status == "succeeded":
+                self.generation_succeeded = True
                 content_data = data.get("content", {})
                 video_url = content_data.get("video_url")
                 if video_url:

@@ -6,6 +6,7 @@
 # - frontend tool results 接力
 # - assistant 协议消息持久化
 
+from contextlib import closing
 from typing import Any
 
 from app.repositories.conversation import ConversationRepository
@@ -264,14 +265,15 @@ class AgentChatService:
 
         final_result = None
 
-        for event in self.runtime.stream_chat(req=req, allow_tools=True):
-            if event.get("type") == "delta":
-                yield event
-                continue
+        with closing(self.runtime.stream_chat(req=req, allow_tools=True)) as stream:
+            for event in stream:
+                if event.get("type") == "delta":
+                    yield event
+                    continue
 
-            if event.get("type") == "final":
-                final_result = event.get("result")
-                break
+                if event.get("type") == "final":
+                    final_result = event.get("result")
+                    break
 
         if final_result is None:
             final_result = AgentTurnResult.completed().to_dict()
@@ -468,14 +470,15 @@ class AgentChatService:
 
         final_result = None
 
-        for event in self.runtime.stream_chat(req=req, allow_tools=True):
-            if event.get("type") == "delta":
-                yield event
-                continue
+        with closing(self.runtime.stream_chat(req=req, allow_tools=True)) as stream:
+            for event in stream:
+                if event.get("type") == "delta":
+                    yield event
+                    continue
 
-            if event.get("type") == "final":
-                final_result = event.get("result")
-                break
+                if event.get("type") == "final":
+                    final_result = event.get("result")
+                    break
 
         if final_result is None:
             final_result = AgentTurnResult.completed().to_dict()

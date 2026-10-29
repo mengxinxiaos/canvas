@@ -451,7 +451,7 @@ class AgentRuntime:
 
         client = self.llm_client or runtime_model_config.client
 
-        gateway = OpenAICompatibleLLMGateway(client)
+        gateway = OpenAICompatibleLLMGateway(client, provider=runtime_model_config.provider)
 
         model_id = runtime_model_config.model_id
 
@@ -542,7 +542,7 @@ class AgentRuntime:
         runtime_model_config = resolve_agent_runtime_model_config(req)
 
         client = self.llm_client or runtime_model_config.client
-        gateway = OpenAICompatibleLLMGateway(client)
+        gateway = OpenAICompatibleLLMGateway(client, provider=runtime_model_config.provider)
         model_id = runtime_model_config.model_id
 
         system_prompt = self.prompt_builder.build(req)
@@ -569,28 +569,31 @@ class AgentRuntime:
             )
         )
 
-        for chunk in stream:
-            if not getattr(chunk, "choices", None):
-                continue
+        try:
+            for chunk in stream:
+                if not getattr(chunk, "choices", None):
+                    continue
 
-            choice = chunk.choices[0]
-            delta = getattr(choice, "delta", None)
+                choice = chunk.choices[0]
+                delta = getattr(choice, "delta", None)
 
-            if delta is None:
-                continue
+                if delta is None:
+                    continue
 
-            content_delta = getattr(delta, "content", None) or ""
+                content_delta = getattr(delta, "content", None) or ""
 
-            if content_delta:
-                full_content += content_delta
-                yield {
-                    "type": "delta",
-                    "content": content_delta,
-                }
+                if content_delta:
+                    full_content += content_delta
+                    yield {
+                        "type": "delta",
+                        "content": content_delta,
+                    }
 
-            tool_calls = getattr(delta, "tool_calls", None)
-            if tool_calls:
-                raw_tool_call_chunks.extend(tool_calls)
+                tool_calls = getattr(delta, "tool_calls", None)
+                if tool_calls:
+                    raw_tool_call_chunks.extend(tool_calls)
+        finally:
+            stream.close()
 
         merged_tool_calls = (
             _merge_stream_tool_call_chunks(raw_tool_call_chunks)

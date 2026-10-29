@@ -11,7 +11,7 @@ import React, {
 import { usePanelPosition } from './hooks/usePanelPosition';
 import { useGenerationParams } from './hooks/useGenerationParams';
 
-import { buildPresetPrompt } from '../../../utils/promptbuilder';
+import { buildPresetPrompt } from '../../../utils/promptBuilder';
 import { getDimensionsByRatio } from '../../../utils/helpers';
 
 import MentionTextarea from './components/MentionTextarea';

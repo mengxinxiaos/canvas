@@ -225,7 +225,7 @@ export function useProjectData(projectId, showToast, yjsInstances, shareToken) {
         sharedYNodes,
     ]);
     // 开启轮询
-    useTaskPolling(updateNodeStrictAndSave);
+    useTaskPolling(updateNodeStrictAndSave, shareToken);
 
     return { isFirstLoad, isSaving, dispatchAndSave, updateNodeStrictAndSave, saveToCloud };
 }

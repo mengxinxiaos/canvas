@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     
 
     # Agent / LLM
+    AGENT_API_KEY: Optional[str] = None
+    AGENT_BASE_URL: Optional[str] = None
+    AGENT_MODEL: str = ""
    
     AGENT_DEFAULT_MAX_TOKENS: int = 8192
     AGENT_ESCALATED_MAX_TOKENS: int = 64000

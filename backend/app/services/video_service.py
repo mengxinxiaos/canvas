@@ -5,6 +5,7 @@ from app.core.database import SessionLocal
 from app.models.domain import Task
 from app.services.ai_utils import download_to_local
 from app.services.video_generation.factory import ClientFactory
+from app.services.billing import begin_call, update_call, finish_call
 
 
 def _get_task(task_id: str):
@@ -21,6 +22,7 @@ def _update_task(
     status: str = None,
     result_json=None,
     error_message: str = None,
+    api_call_id: str = None,
 ):
     db = SessionLocal()
     try:
@@ -34,6 +36,8 @@ def _update_task(
             task.result_json = result_json
         if error_message is not None:
             task.error_message = error_message
+        if api_call_id is not None:
+            task.api_call_id = api_call_id
 
         db.commit()
         db.refresh(task)
@@ -67,6 +71,9 @@ async def process_video_task(task_id: str):
     if not task:
         return
 
+    call_id = None
+    upstream_finished = False
+    video_client = None
     try:
         # 1. 初始化任务状态（短连接）
         _update_task(task_id, status="running")
@@ -75,11 +82,11 @@ async def process_video_task(task_id: str):
         req = task.request_json or {}
         prompt = req.get("prompt")
 
-        raw_model = req.get("model", "doubao-seedance-1-5-pro-251215")
-        parts = raw_model.split("-", 1)
-        model = parts[1]
-
+        raw_model = req.get("model", "")
         provider = req.get("provider", "")
+        # The UI prefixes video model IDs with the provider. Preserve bare IDs.
+        prefix = f"{provider}-"
+        model = raw_model[len(prefix):] if provider and raw_model.startswith(prefix) else raw_model
         resolution = req.get("resolution", "720p")
         ratio = req.get("aspectRatio") or req.get("ratio") or "adaptive"
         project_id = task.project_id
@@ -128,6 +135,22 @@ async def process_video_task(task_id: str):
         
         # 5. 获取客户端
         video_client = ClientFactory.get_client(provider)
+        call_id = begin_call(
+            user_id=task.user_id,
+            project_id=project_id,
+            node_id=task.node_id,
+            task_id=task_id,
+            provider=video_client.actual_provider,
+            model=model,
+            call_type="video_generation",
+            parameters={
+                "duration": duration, "resolution": resolution,
+                "ratio": ratio, "mode": final_mode,
+                "has_video_input": bool(kwargs.get("video_urls")),
+                "video_input_count": len(kwargs.get("video_urls") or []),
+            },
+        )
+        _update_task(task_id, api_call_id=call_id)
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             remote_task_id, msg = await video_client.submit_task(
@@ -136,6 +159,13 @@ async def process_video_task(task_id: str):
 
             if not remote_task_id:
                 raise Exception(f"提交任务失败: {msg}") 
+
+            # Persist the supplier task ID as soon as submission succeeds.
+            update_call(
+                call_id,
+                provider_request_id=str(remote_task_id),
+                metadata=video_client.billing_metadata,
+            )
 
             max_queue_seconds = 1800
             max_process_seconds = 600
@@ -155,6 +185,13 @@ async def process_video_task(task_id: str):
                 status, result_data = await video_client.query_status(client, remote_task_id)
 
                 if status == "Success":
+                    finish_call(
+                        call_id,
+                        status="success",
+                        provider_request_id=str(remote_task_id),
+                        metadata=video_client.billing_metadata,
+                    )
+                    upstream_finished = True
                     remote_video_url = await video_client.get_download_url(client, result_data)
                     break
 
@@ -168,7 +205,7 @@ async def process_video_task(task_id: str):
 
                     queue_elapsed += poll_interval
                     if queue_elapsed >= max_queue_seconds:
-                        raise Exception(f"排队超时，已取消 (等候了 {queue_elapsed} 秒)")
+                        raise Exception(f"排队等待超时，上游任务可能仍在执行 (等候了 {queue_elapsed} 秒)")
 
                     if queue_elapsed % 60 == 0:
                         print(f"[Task {task_id}] [{model}] 排队中... 已耗时 {queue_elapsed} 秒")
@@ -204,6 +241,14 @@ async def process_video_task(task_id: str):
             )
 
     except Exception as e:
+        if call_id and not upstream_finished:
+            finish_call(
+                call_id,
+                status="success" if getattr(video_client, "generation_succeeded", False) else "failed",
+                metadata=getattr(video_client, "billing_metadata", None),
+                provider_request_id=getattr(video_client, "provider_request_id", None),
+                error=type(e).__name__,
+            )
         error_msg = f"视频生成失败: {str(e)}"
         print(f"⚠️ [Task {task_id}] Failed: {error_msg}")
         _update_task(

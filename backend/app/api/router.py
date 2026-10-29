@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.endpoints import auth, projects, media, tasks, image_tasks, video_tasks, agent
+from app.api.endpoints import auth, projects, media, tasks, image_tasks, video_tasks, agent, billing
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["Auth"])
@@ -12,3 +12,4 @@ api_router.include_router(video_tasks.router, prefix="/tasks", tags=["Video Gene
 api_router.include_router(tasks.router, prefix="/tasks", tags=["Task Status"])
 
 api_router.include_router(agent.router, prefix="/agent", tags=["Agent"])
+api_router.include_router(billing.router, prefix="/admin", tags=["API Usage"])
