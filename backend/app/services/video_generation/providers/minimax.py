@@ -5,7 +5,7 @@ from app.core.config import settings
 
 class MiniMaxClient(BaseVideoClient):
     def __init__(self):
-        self.api_key = settings.MINIMAX_API_KEY or "sk-api-2UGLpBc6gubgHFGN5uoBsLp-JOrzKGzvsUoqiogoRQK-D8CCe_Na662T1_4zWJPjUrqizNctpfFYM1jnMsQVNc1co6XlFqJEYSuXoB1m2z_Ld4KIB54-nDY"
+        self.api_key = settings.MINIMAX_API_KEY
         base_url = settings.MINIMAX_API_BASE or "https://api.minimaxi.com/v1/video_generation"
         self.base_url = base_url.strip()
         self.query_url = "https://api.minimaxi.com/v1/query/video_generation"
