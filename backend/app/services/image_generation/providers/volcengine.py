@@ -5,6 +5,7 @@ from app.services.image_generation.utils import IMAGE_API_TIMEOUT
 
 class VolcengineClient(BaseImageClient):
     def __init__(self, is_po_xian: bool = False):
+        super().__init__(provider="poxian" if is_po_xian else "volcengine")
         if is_po_xian:
             env_base = settings.VOLCENGINE_POXIAN_API_BASE
             self.api_key = settings.VOLCENGINE_POXIAN_API_KEY
@@ -23,6 +24,7 @@ class VolcengineClient(BaseImageClient):
         return "2048x2048"
 
     async def generate(self, client: httpx.AsyncClient, prompt: str, model: str, aspect_ratio: str, image_size: str, image_urls=None, **kwargs):
+        self._reset_billing(model=model)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
@@ -44,9 +46,12 @@ class VolcengineClient(BaseImageClient):
             res = await client.post(self.base_url, headers=headers, json=payload)
             res.raise_for_status()
             result = res.json()
+            self._capture_billing(result)
             urls = [item.get("url") for item in result.get("data", []) if item.get("url")]
             if urls:
+                self.generation_succeeded = True
+                self.billing_metadata.setdefault("usage_json", {})["image_count"] = len(urls)
                 return urls, "Success"
-            return None, f"API Error: {result}"
+            return None, "供应商响应中未找到图片 URL，请联系管理员核对调用记录。"
         except Exception as e:
             return None, f"Volcengine Error: {str(e)}"

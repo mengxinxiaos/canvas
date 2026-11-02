@@ -5,7 +5,7 @@ import { IMAGE_MODELS, VIDEO_MODELS } from '../config/constants';
 const VALID_MEDIA_TYPES = ['picture', 'image'];
 // 纯函数：不再依赖 React 环境的 state 和 hook
 export const aiGenerationService = {
-    async submitTask({ projectId, genParams, canvasState, updateNodeStrictAndSave, pushHistory, showToast }) {
+    async submitTask({ projectId, shareToken, genParams, canvasState, updateNodeStrictAndSave, pushHistory, showToast }) {
         const generatorNode = canvasState.nodes.find(n => n.id === genParams.nodeId);
         if (!generatorNode || generatorNode._isLoading) return;
         
@@ -54,8 +54,8 @@ export const aiGenerationService = {
 
             const result = await (
                 generatorNode.type === 'video' 
-                ? taskService.createVideoTask(finalPayload) 
-                : taskService.createImageTask(finalPayload)
+                ? taskService.createVideoTask(finalPayload, shareToken)
+                : taskService.createImageTask(finalPayload, shareToken)
             );
                 
             if (!result || !result.taskId) {

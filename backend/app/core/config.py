@@ -7,6 +7,19 @@ class Settings(BaseSettings):
     APP_PORT: int = 8000
     DEBUG: bool = True
     
+
+    # Agent / LLM
+    AGENT_API_KEY: Optional[str] = None
+    AGENT_BASE_URL: Optional[str] = None
+    AGENT_MODEL: str = ""
+   
+    AGENT_DEFAULT_MAX_TOKENS: int = 8192
+    AGENT_ESCALATED_MAX_TOKENS: int = 64000
+    AGENT_MAX_RETRIES: int = 10
+    AGENT_BASE_DELAY_MS: int = 500
+    AGENT_MAX_DELAY_MS: int = 32000
+    AGENT_MAX_CONTINUATIONS: int = 3
+
     # ==========================================
     # 🚨 强制必填项 (无默认值)
     # 如果 .env 或环境变量中没有这些值，应用启动时会直接报错阻止运行
@@ -19,9 +32,9 @@ class Settings(BaseSettings):
 
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7 
     
-    IMAGE_API_BASE: Optional[str] = None
-    IMAGE_API_KEY: Optional[str] = None
-    IMAGE_API_KEY_GPT: Optional[str] = None
+    ZHENZHEN_API_BASE: Optional[str] = None
+    ZHENZHEN_API_KEY: Optional[str] = None
+    ZHENZHEN_API_KEY_GPT: Optional[str] = None
 
     VOLCENGINE_API_BASE: Optional[str] = None
     VOLCENGINE_API_KEY: Optional[str] = None
@@ -31,6 +44,9 @@ class Settings(BaseSettings):
     MINIMAX_API_BASE: Optional[str] = None
     MINIMAX_API_KEY: Optional[str] = None
     
+    RUNNINGHUB_API_BASE: Optional[str] = None
+    RUNNINGHUB_API_KEY: Optional[str] = None
+
     DASHSCOPE_API_KEY: str | None = None
     ALIYUN_API_KEY: str | None = None
 

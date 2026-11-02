@@ -11,18 +11,26 @@ export default function NodeWrapper({
     
     const showResizeHandle = (isMedia || isGen || isText) && !isDrawing && !isCropping && !isMultiSelected;
     return (
-        <div data-node-id={node.id} 
-             onPointerDown={(e) => actions.onPointerDown(e, node.id)}
-             onDoubleClick={(e) => actions.onDoubleClick?.(e, node)}
-             className={`absolute group ${(isDrawing || isCropping) ? 'z-50' : 'z-10'}`}
-             style={{ 
-               transform: `translate3d(${node.position.x}px, ${node.position.y}px, 0)`,
-               width: node.size.w, 
-               height: node.size.h, 
-               cursor: isDrawing ? 'crosshair' : (isText && isEditingText ? 'text' : 'grab'),
-               willChange: 'transform, width, height',
-               transition: 'width 0.3s cubic-bezier(0.25, 1, 0.5, 1), height 0.3s cubic-bezier(0.25, 1, 0.5, 1)'
-             }}>
+        <div
+            data-node-id={node.id}
+            onPointerDown={(e) => {
+                if (actions.onAgentPickNode?.(e, node)) {
+                    return;
+                }
+
+                actions.onPointerDown(e, node.id);
+            }}
+            onDoubleClick={(e) => actions.onDoubleClick?.(e, node)}
+            className={`absolute group ${(isDrawing || isCropping) ? 'z-50' : 'z-10'}`}
+            style={{
+                transform: `translate3d(${node.position.x}px, ${node.position.y}px, 0)`,
+                width: node.size.w,
+                height: node.size.h,
+                cursor: isDrawing ? 'crosshair' : (isText && isEditingText ? 'text' : 'grab'),
+                willChange: 'transform, width, height',
+                transition: 'width 0.3s cubic-bezier(0.25, 1, 0.5, 1), height 0.3s cubic-bezier(0.25, 1, 0.5, 1)'
+            }}
+        >
           
           <div className="absolute left-[-16px] top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center cursor-crosshair z-20 opacity-0 group-hover:opacity-100 transition-opacity"
                onPointerDown={(e) => {e.preventDefault(); e.stopPropagation(); actions.onEdgeStart(e, node.id, 'left')}}>

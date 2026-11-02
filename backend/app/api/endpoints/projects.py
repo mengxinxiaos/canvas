@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect,Header
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -9,6 +9,7 @@ from app.models.domain import Project, User
 from app.utils import get_project_folder, rename_project_folder
 from app.core.websocket import manager
 from datetime import timezone
+from app.services.project_access import ProjectAccessPolicy
 
 router = APIRouter()
 
@@ -70,17 +71,32 @@ def create_project(req: ProjectCreate, db: Session = Depends(get_db), current_us
     return {"code": 0, "message": "ok", "data": {"id": p.id}}
 
 @router.get("/{project_id}")
-def get_project(project_id: str, db: Session = Depends(get_db)):
-    """
-    获取项目详情（支持分享访问，无需登录）
-    """
-    p = db.query(Project).filter(Project.id == project_id).first()
-    if not p: return {"code": 404, "message": "项目不存在"}
-    
-    return {"code": 0, "message": "ok", "data": {
-        "id": p.id, "name": p.name, "ownerId": p.owner_id, "version": p.version,
-        "viewport": p.viewport_json, "nodes": p.content_json.get("nodes", []), "edges": p.content_json.get("edges", [])
-    }}
+def get_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+):
+    access = ProjectAccessPolicy(db)
+    p = access.assert_can_view(
+        project_id=project_id,
+        current_user=current_user,
+        share_token=share_token,
+    )
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "id": p.id,
+            "name": p.name,
+            "ownerId": p.owner_id,
+            "version": p.version,
+            "viewport": p.viewport_json,
+            "nodes": p.content_json.get("nodes", []),
+            "edges": p.content_json.get("edges", []),
+        },
+    }
 
 # WebSocket 路由，让前端连进来
 @router.websocket("/{project_id}/ws")
@@ -94,40 +110,71 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
         manager.disconnect(websocket, project_id)
 
 @router.put("/{project_id}")
-async def update_project(project_id: str, req: ProjectUpdate, db: Session = Depends(get_db)):
-    p = db.query(Project).filter(Project.id == project_id).first()
-    if not p:
-        return {"code": 404, "message": "项目不存在"}
-    
+async def update_project(
+    project_id: str,
+    req: ProjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user),
+    share_token: str | None = Header(default=None, alias="X-Project-Share-Token"),
+):
+    access = ProjectAccessPolicy(db)
+    p = access.assert_can_edit(
+        project_id=project_id,
+        current_user=current_user,
+        share_token=share_token,
+    )
+
+    # 保存画布内容时，必须带 version
+    is_content_update = req.nodes is not None or req.edges is not None or req.viewport is not None
+    if is_content_update and req.version is None:
+        return {
+            "code": 400,
+            "message": "保存项目必须携带 version",
+            "data": None,
+        }
+
     if req.version is not None and p.version != req.version:
-        return {"code": 4090, "message": "数据冲突，版本不一致", "data": {"serverVersion": p.version}}
-    
+        return {
+            "code": 4090,
+            "message": "数据冲突，版本不一致",
+            "data": {"serverVersion": p.version},
+        }
+
     old_name = p.name
-    
+
     if req.name is not None:
         p.name = req.name
+
     if req.viewport is not None:
         p.viewport_json = req.viewport
+
     if req.nodes is not None and req.edges is not None:
-        p.content_json = {"nodes": req.nodes, "edges": req.edges}
+        p.content_json = {
+            "nodes": req.nodes,
+            "edges": req.edges,
+        }
+
     if req.thumbnail is not None:
         p.thumbnail = req.thumbnail
-    
+
     p.version += 1
     db.commit()
-    
+    db.refresh(p)
+
     if req.name is not None:
         rename_project_folder(db, p, old_name)
 
-    # 数据库保存成功后，通知房间里的其他人！
-    # 为了防止发送广播时阻塞接口响应，最好不要让当前保存的用户卡住
     await manager.broadcast({
         "type": "PROJECT_UPDATED",
         "version": p.version,
-        "message": "项目数据已更新"
+        "message": "项目数据已更新",
     }, project_id)
-    
-    return {"code": 0, "message": "ok", "data": {"version": p.version}}
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {"version": p.version},
+    }
 
 @router.post("/{project_id}/move")
 def move_project(project_id: str, req: ProjectMove, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -182,9 +229,22 @@ def move_project(project_id: str, req: ProjectMove, db: Session = Depends(get_db
     return {"code": 0, "message": "ok"}
     
 @router.delete("/{project_id}")
-def delete_project(project_id: str, db: Session = Depends(get_db)):
-    db.query(Project).filter(Project.id == project_id).delete()
+def delete_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    p = db.query(Project).filter(
+        Project.id == project_id,
+        Project.owner_id == current_user.id,
+    ).first()
+
+    if not p:
+        return {"code": 404, "message": "项目不存在或无权删除"}
+
+    db.delete(p)
     db.commit()
+
     return {"code": 0, "message": "ok"}
 
 # 补充缺失的分享接口
@@ -204,10 +264,25 @@ def create_share(project_id: str, req: ShareRequest, db: Session = Depends(get_d
     if p.owner_id != current_user.id:
         return {"code": 403, "message": "无权分享该项目"}
     
-    # 生成分享 token（本版本直接返回 UUID 给前端拼接使用）
-    share_token = uuid.uuid4().hex
-    
-    return {"code": 0, "message": "ok", "data": {"token": share_token}}
+    # 生成分享 token
+    if not p.share_token:
+        p.share_token = uuid.uuid4().hex
+
+    p.share_enabled = True
+    p.share_permission = req.permission or "edit"
+
+    db.commit()
+    db.refresh(p)
+
+    return {
+        "code": 0,
+        "message": "ok",
+        "data": {
+            "projectId": p.id,
+            "token": p.share_token,
+            "permission": p.share_permission,
+        },
+    }
 
 @router.get("/shared/{share_token}")
 def get_shared_project(share_token: str, db: Session = Depends(get_db)):

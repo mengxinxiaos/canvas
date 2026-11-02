@@ -1,4 +1,5 @@
-import { fetchApi } from '../utils/http';
+import { fetchApi,fetchRawApi } from '../utils/http';
+import { consumeSSEStream } from '../utils/sse';
 
 export const authService = {
     login: (username, password) => fetchApi('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
@@ -16,13 +17,25 @@ export const projectService = {
     fetchProjects: (parentId = null) => fetchApi(parentId ? `/api/projects?parent_id=${parentId}` : '/api/projects'),
     
     // 2. 获取单个项目详情
-    fetchProject: (id) => fetchApi(`/api/projects/${id}`),
+    fetchProject: (id, shareToken) =>
+        fetchApi(`/api/projects/${id}`, {
+            headers: shareToken
+                ? { 'X-Project-Share-Token': shareToken }
+                : {},
+        }),
     
     // 3. 创建项目/文件夹 (已合并并保留支持目录层级的版本)
     createProject: (name, isFolder = false, parentId = null) => fetchApi('/api/projects', { method: 'POST', body: JSON.stringify({ name, is_folder: isFolder, parent_id: parentId }) }),
     
     // 4. 更新项目 (合并了 saveProject 和 updateProject，因为它们路由和方法完全一样)
-    updateProject: (id, payload) => fetchApi(`/api/projects/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
+    updateProject: (id, payload, shareToken) =>
+        fetchApi(`/api/projects/${id}`, {
+            method: 'PUT',
+            body: JSON.stringify(payload),
+            headers: shareToken
+                ? { 'X-Project-Share-Token': shareToken }
+                : {},
+        }),
     
     // 5. 删除项目
     deleteProject: (id) => fetchApi(`/api/projects/${id}`, { method: 'DELETE' }),
@@ -33,9 +46,15 @@ export const projectService = {
         body: JSON.stringify({ parent_id: targetParentId }) 
     }),
 
-    saveProject: async (id, payload) => {
-        return fetchApi(`/api/projects/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
-    }
+    saveProject: async (id, payload, shareToken) => {
+        return fetchApi(`/api/projects/${id}`, {
+            method: 'PUT',
+            body: JSON.stringify(payload),
+            headers: shareToken
+                ? { 'X-Project-Share-Token': shareToken }
+                : {},
+        });
+    },
 };
 
 export const mediaService = {
@@ -50,11 +69,112 @@ export const mediaService = {
 };
 
 export const taskService = {
-    createImageTask: (payload) => fetchApi('/api/tasks/image-generation', { method: 'POST', body: JSON.stringify(payload) }),
-    createVideoTask: (payload) => fetchApi('/api/tasks/video-generation', { method: 'POST', body: JSON.stringify(payload) }),
-    queryTaskStatus: (taskId) => fetchApi(`/api/tasks/${taskId}`)
+    createImageTask: (payload, shareToken) => fetchApi('/api/tasks/image-generation', { method: 'POST', body: JSON.stringify(payload), headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} }),
+    createVideoTask: (payload, shareToken) => fetchApi('/api/tasks/video-generation', { method: 'POST', body: JSON.stringify(payload), headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} }),
+    queryTaskStatus: (taskId, shareToken) => fetchApi(`/api/tasks/${taskId}`, { headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {} })
+};
+
+const billingQuery = (filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+        if (value !== '' && value !== null && value !== undefined) params.set(key, String(value));
+    });
+    const query = params.toString();
+    return query ? `?${query}` : '';
+};
+
+export const billingService = {
+    listCalls: (filters) => fetchApi(`/api/admin/api-calls${billingQuery(filters)}`),
+    getSummary: (filters) => fetchApi(`/api/admin/api-calls/summary${billingQuery(filters)}`),
 };
 
 export const shareService = {
     createShare: (projectId, permission) => fetchApi(`/api/projects/${projectId}/share`, { method: 'POST', body: JSON.stringify({ permission }) })
+};
+
+export const withShareToken = (shareToken) => {
+    if (!shareToken) return {};
+    return {
+        headers: {
+            'X-Project-Share-Token': shareToken,
+        },
+    };
+};
+
+export const agentService = {
+    createConversation: (payload, shareToken) =>
+        fetchApi('/api/agent/conversations', {
+            method: 'POST',
+            body: JSON.stringify(payload),
+            headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {},
+        }),
+
+    listConversations: (projectId, shareToken) =>
+        fetchApi(`/api/agent/conversations?projectId=${encodeURIComponent(projectId)}`, {
+            headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {},
+        }),
+
+    getConversation: (conversationId, shareToken) =>
+        fetchApi(`/api/agent/conversations/${conversationId}`, {
+            headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {},
+        }),
+
+    sendMessage: (conversationId, payload, shareToken) =>
+        fetchApi(`/api/agent/conversations/${conversationId}/messages`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+            headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {},
+        }),
+
+    submitToolResults: (conversationId, payload, shareToken) =>
+        fetchApi(`/api/agent/conversations/${conversationId}/tool-results`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+            headers: shareToken ? { 'X-Project-Share-Token': shareToken } : {},
+        }),
+    deleteConversation: (conversationId, shareToken) =>
+        fetchApi(`/api/agent/conversations/${conversationId}`, {
+            method: 'DELETE',
+            headers: shareToken
+                ? { 'X-Project-Share-Token': shareToken }
+                : {},
+        }),
+
+    listSkills: (shareToken) =>
+        fetchApi('/api/agent/skills', {
+            headers: shareToken
+                ? { 'X-Project-Share-Token': shareToken }
+                : {},
+        }),
+    sendMessageStream: async (conversationId, payload, shareToken, handlers = {}) => {
+        const response = await fetchRawApi(
+            `/api/agent/conversations/${conversationId}/messages/stream`,
+            {
+                method: 'POST',
+                body: JSON.stringify(payload),
+                headers: {
+                    Accept: 'text/event-stream',
+                    ...(shareToken ? { 'X-Project-Share-Token': shareToken } : {}),
+                },
+            },
+        );
+
+        return consumeSSEStream(response, handlers);
+    },
+
+    submitToolResultsStream: async (conversationId, payload, shareToken, handlers = {}) => {
+        const response = await fetchRawApi(
+            `/api/agent/conversations/${conversationId}/tool-results/stream`,
+            {
+                method: 'POST',
+                body: JSON.stringify(payload),
+                headers: {
+                    Accept: 'text/event-stream',
+                    ...(shareToken ? { 'X-Project-Share-Token': shareToken } : {}),
+                },
+            },
+        );
+
+        return consumeSSEStream(response, handlers);
+    },
 };

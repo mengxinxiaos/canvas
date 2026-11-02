@@ -1,0 +1,1397 @@
+diff --git a/backend/app/services/pricing.py b/backend/app/services/pricing.py
+--- a/backend/app/services/pricing.py
++++ b/backend/app/services/pricing.py
+@@ -4,10 +4,9 @@
+ must retain provider_cost separately and pass that raw amount on every update;
+ never feed a previously calculated amount back as provider_cost.
+ 
+-Each selected rule is copied in full into its snapshot. Reusing that snapshot
+-freezes prices while still allowing final response inputs (tokens, resolution,
+-actual model) to refine the calculation. An unknown model never inherits a
+-nearby model's price. Adding a future model is a declarative JSON change.
++New calls freeze the full catalogue, so an actual model disclosed only after
++submission can select its specific rule without consulting later prices.
++Legacy snapshots containing only a selected rule remain supported.
+ """
+ from copy import deepcopy
+ from decimal import Decimal, InvalidOperation, localcontext
+@@ -69,12 +68,34 @@
+ 
+ def _match_model(rule: dict, model: str, provider: str) -> str | None:
+     aliases = rule.get("model_aliases", {}).get(provider, [])
+-    if model in aliases:
++    if model in {_normalized_model(alias, provider) for alias in aliases}:
+         return "alias"
++    if model in {_normalized_model(value, provider) for value in rule.get("models", [])}:
++        return "model"
+     for pattern in rule.get("model_patterns", []):
+         if re.fullmatch(pattern, model):
+             return "model"
+     return None
++
++
++def _has_model_selector(rule: dict) -> bool:
++    return bool(rule.get("models") or rule.get("model_patterns") or rule.get("model_aliases"))
++
++
++def _validate_matchers(rule: dict) -> None:
++    for name in ("providers", "call_types", "models", "model_patterns"):
++        values = rule.get(name, [])
++        if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
++            raise ValueError(f"Invalid rule {name}")
++    if not rule.get("providers"):
++        raise ValueError("Rule has no provider")
++    aliases = rule.get("model_aliases", {})
++    if not isinstance(aliases, dict):
++        raise ValueError("Invalid model aliases")
++    for provider, values in aliases.items():
++        if (not isinstance(provider, str) or not isinstance(values, list)
++                or any(not isinstance(value, str) or not value.strip() for value in values)):
++            raise ValueError("Invalid model aliases")
+ 
+ 
+ def _model_selection(rule: dict, provider: str, model: Any, billing_model: Any) -> tuple[str | None, str | None]:
+@@ -117,26 +138,146 @@
+ 
+ 
+ def _select_rule(policy: dict, provider: str, model: Any, billing_model: Any, call_type: str):
+-    provider_rules = [r for r in policy["rules"] if isinstance(r, dict) and provider in r.get("providers", [])]
++    active = []
++    for rule in policy["rules"]:
++        if not isinstance(rule, dict) or not isinstance(rule.get("enabled", True), bool):
++            raise ValueError("Invalid pricing rule")
++        if rule.get("enabled", True) is False:
++            continue
++        _validate_matchers(rule)
++        active.append(rule)
++    provider_rules = [rule for rule in active if provider in rule["providers"]]
+     type_rules = [r for r in provider_rules if not r.get("call_types") or call_type in r["call_types"]]
+     matches = []
+     model_reason = "unknown_model"
+     for rule in type_rules:
+-        if rule.get("kind") == "provider_multiplier":
+-            matches.append(rule)
+-        elif rule.get("kind") == "token_rate":
++        if rule.get("kind") not in {"provider_multiplier", "token_rate", "unit_rate"}:
++            raise ValueError("Unsupported pricing rule kind")
++        if _has_model_selector(rule):
+             selected, basis = _model_selection(rule, provider, model, billing_model)
+             if selected:
+-                matches.append(rule)
++                matches.append(((1, bool(rule.get("call_types"))), rule))
+             elif basis == "model_conflict":
+                 model_reason = basis
+-    if len(matches) > 1:
+-        raise ValueError("Ambiguous pricing rules")
++        else:
++            matches.append(((0, bool(rule.get("call_types"))), rule))
+     if matches:
+-        return matches[0], None
++        # A model override always outranks a provider-wide fallback. Order in
++        # the file must never decide which monetary rule wins.
++        highest = max(score for score, _ in matches)
++        winners = [rule for score, rule in matches if score == highest]
++        if len(winners) > 1:
++            raise ValueError("Ambiguous pricing rules")
++        return winners[0], None
+     if provider_rules and not type_rules:
+         return None, "unsupported_call_type"
+     return None, model_reason if provider_rules else "unsupported_provider"
++
++
++def _path_value(values: dict, path: str) -> tuple[bool, Any]:
++    node = values
++    for key in path.split("."):
++        if not isinstance(node, dict) or key not in node:
++            return False, None
++        node = node[key]
++    return True, node
++
++
++def _quantity(unit: str, rule: dict, parameters: dict, usage: dict) -> tuple[Decimal | None, str, str, str | None]:
++    """Prefer real output; request quantities are fallback only when absent."""
++    if unit == "image":
++        actual_fields = ("image_count", "generated_images", "images")
++        requested_fields = ("image_count", "n", "num_images")
++        label = "image_count"
++    elif unit == "second":
++        actual_fields = ("duration_seconds", "video_seconds", "duration", "seconds")
++        requested_fields = ("duration_seconds", "duration", "video_seconds", "seconds")
++        label = "duration_seconds"
++    else:
++        field = rule.get("usage_field", "total_tokens")
++        if not isinstance(field, str) or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*", field):
++            raise ValueError("Invalid token usage field")
++        actual_fields = (field,)
++        requested_fields = ()
++        label = "token_quantity"
++    for source, values, fields in (
++        ("provider_response", usage, actual_fields),
++        ("request_parameters", parameters, requested_fields),
++    ):
++        for field in fields:
++            present, value = _path_value(values, field)
++            if not present:
++                continue
++            number = _decimal(value)
++            if number is None or (unit in {"image", "token"} and number != number.to_integral_value()):
++                return None, source, field, f"invalid_{label}"
++            return number, source, field, None
++    return None, "provider_response" if unit == "token" else "request_parameters", actual_fields[0], f"missing_{label}"
++
++
++def _same_selector(actual: Any, expected: Any) -> bool:
++    if isinstance(expected, bool):
++        return isinstance(actual, bool) and actual is expected
++    if isinstance(expected, str):
++        return isinstance(actual, str) and actual.strip().casefold() == expected.strip().casefold()
++    if isinstance(expected, (int, float, Decimal)):
++        if isinstance(actual, bool):
++            return False
++        left, right = _decimal(actual), _decimal(expected)
++        return left is not None and right is not None and left == right
++    raise ValueError("Invalid price selector")
++
++
++def _unit_price(rule: dict, parameters: dict) -> tuple[Any, Any, dict | None]:
++    variants = rule.get("price_variants", [])
++    if not isinstance(variants, list):
++        raise ValueError("Invalid price variants")
++    matches = []
++    for variant in variants:
++        if not isinstance(variant, dict) or not isinstance(variant.get("when"), dict) or not variant["when"]:
++            raise ValueError("Invalid price variant")
++        conditions = variant["when"]
++        if any(not isinstance(key, str) or not isinstance(value, (str, bool, int, float, Decimal))
++               for key, value in conditions.items()):
++            raise ValueError("Invalid price selector")
++        if all(key in parameters and _same_selector(parameters[key], value) for key, value in conditions.items()):
++            matches.append(variant)
++    if matches:
++        largest = max(len(variant["when"]) for variant in matches)
++        winners = [variant for variant in matches if len(variant["when"]) == largest]
++        if len(winners) != 1:
++            raise ValueError("Ambiguous price variants")
++        winner = winners[0]
++        return winner.get("unit_price"), winner.get("unit_size", rule.get("unit_size", "1")), winner["when"]
++    return rule.get("unit_price"), rule.get("unit_size", "1"), None
++
++
++def _calculate_unit_rate(snapshot: dict, rule: dict, parameters: dict, usage: dict, call_type: str, currency: str) -> dict:
++    unit = rule.get("unit")
++    if unit not in {"image", "second", "token"}:
++        raise ValueError("Unsupported pricing unit")
++    snapshot.update(billing_mode="local", unit=unit, formula="quantity / unit_size * unit_price")
++    if ((unit == "image" and call_type != "image_generation")
++            or (unit == "second" and call_type != "video_generation")):
++        return _result(snapshot, reason="unsupported_call_type")
++    price_value, size_value, conditions = _unit_price(rule, parameters)
++    if price_value is None and conditions is None and rule.get("price_variants"):
++        return _result(snapshot, reason="no_matching_price_variant")
++    price, size = _decimal(price_value), _decimal(size_value)
++    if price is None or size is None or size <= 0:
++        raise ValueError("Invalid unit price")
++    snapshot.update(unit_price=format(price, "f"), unit_size=format(size, "f"))
++    if conditions is not None:
++        snapshot["price_conditions"] = deepcopy(conditions)
++    quantity, source, field, reason = _quantity(unit, rule, parameters, usage)
++    snapshot.update(quantity=format(quantity, "f") if quantity is not None else None,
++                    quantity_source=source, quantity_field=field)
++    if reason:
++        return _result(snapshot, reason=reason)
++    with localcontext() as context:
++        context.prec = 256
++        cost = quantity / size * price
++    return _result(snapshot, cost=cost, currency=currency, status="calculated")
+ 
+ 
+ def calculate_cost(
+@@ -149,9 +290,8 @@
+ 
+     `parameters.has_video_input` must describe video actually sent upstream,
+     rather than just a requested reference mode. Missing values stay unpriced.
+-    A saved snapshot with a `rule` freezes the entire selected rule. A snapshot
+-    without a matched rule freezes the whole policy, so final actual-model data
+-    may resolve a rule from that original policy without consulting later prices.
++    New snapshots freeze the whole policy; final actual-model data may resolve
++    a more specific rule from that original policy without using later prices.
+     """
+     provider = str(provider or "default").strip().lower()
+     parameters = parameters if isinstance(parameters, dict) else {}
+@@ -163,10 +303,18 @@
+ 
+     try:
+         frozen = rule_snapshot if isinstance(rule_snapshot, dict) else {}
+-        if isinstance(frozen.get("rule"), dict):
++        if (frozen.get("reason") == "invalid_pricing_config"
++                and not isinstance(frozen.get("rule"), dict)
++                and not isinstance(frozen.get("policy"), dict)):
++            # No valid starting policy existed. Repairing configuration may
++            # price new calls, but must not invent the rate for this old call.
++            snapshot["source"] = frozen.get("source", "user_config")
++            return _result(snapshot, reason="invalid_pricing_config")
++        if isinstance(frozen.get("rule"), dict) and not isinstance(frozen.get("policy"), dict):
+             if frozen.get("provider") != provider:
+                 return _result(snapshot, reason="model_conflict")
+             rule = deepcopy(frozen["rule"])
++            _validate_matchers(rule)
+             for key in ("source", "rule_id", "rule_version", "policy_hash"):
+                 if key in frozen:
+                     snapshot[key] = deepcopy(frozen[key])
+@@ -183,19 +331,18 @@
+                     raise ValueError("Invalid frozen pricing policy")
+             else:
+                 policy = load_pricing_rules()
++            snapshot.update(source=policy.get("source", "user_config"),
++                            policy_hash=policy["policy_hash"], rule_version=policy["version"],
++                            policy=deepcopy(policy))
+             rule, reason = _select_rule(policy, provider, model, billing_model, call_type)
+             if rule is None:
+-                snapshot.update(source=policy.get("source", "user_config"), policy_hash=policy["policy_hash"], rule_version=policy["version"])
+-                # A newly added model must not retroactively price an in-flight
+-                # unmatched call. Freeze the full catalogue while its identity
+-                # is unknown; final actual-model data can resolve within it.
+-                snapshot["policy"] = deepcopy(policy)
+                 # Only configured suppliers are subject to their strict local
+                 # policy. Other suppliers may expose an already-priced amount.
+-                configured = any(provider in r.get("providers", []) for r in policy["rules"] if isinstance(r, dict))
++                configured = any(provider in r.get("providers", []) and r.get("enabled", True) is not False
++                                 for r in policy["rules"] if isinstance(r, dict))
+                 if not configured:
+                     amount = _decimal(provider_cost)
+-                    snapshot.update(kind="provider_reported", source="provider_response", provider_cost=format(amount, "f") if amount is not None else None,
++                    snapshot.update(kind="provider_reported", billing_mode="provider_reported", source="provider_response", provider_cost=format(amount, "f") if amount is not None else None,
+                                     provider_currency=_text(provider_currency, 32), formula="provider_cost")
+                     if amount is not None:
+                         return _result(snapshot, cost=amount, currency=_text(provider_currency, 32), status="reported")
+@@ -203,10 +350,16 @@
+             snapshot.update(source=policy.get("source", "user_config"), rule_id=rule.get("id"), rule_version=policy["version"], policy_hash=policy["policy_hash"])
+ 
+         snapshot.update(kind=rule.get("kind"), rule=deepcopy(rule))
++        if _has_model_selector(rule):
++            matched, basis = _model_selection(rule, provider, model, billing_model)
++            if not matched:
++                return _result(snapshot, reason=basis)
++            snapshot.update(matched_model=matched, model_match_basis=basis)
+         currency = _text(rule.get("currency"), 32)
+         if not currency:
+             raise ValueError("Pricing rule has no currency")
+         if rule.get("kind") == "provider_multiplier":
++            snapshot["billing_mode"] = "provider_reported"
+             multiplier = _decimal(rule.get("multiplier"))
+             if multiplier is None:
+                 raise ValueError("Invalid cost multiplier")
+@@ -220,12 +373,15 @@
+                 calculated = amount * multiplier
+             return _result(snapshot, cost=calculated, currency=currency, status="calculated")
+ 
++        if rule.get("kind") == "unit_rate":
++            return _calculate_unit_rate(snapshot, rule, parameters, usage, call_type, currency)
++
+         if rule.get("kind") != "token_rate":
+             raise ValueError("Unsupported pricing rule kind")
+         matched, basis = _model_selection(rule, provider, model, billing_model)
+         if not matched:
+             return _result(snapshot, reason=basis)
+-        snapshot.update(matched_model=matched, model_match_basis=basis,
++        snapshot.update(matched_model=matched, model_match_basis=basis, billing_mode="local", unit="token",
+                         formula="total_tokens / token_unit * rate_per_million_tokens")
+         resolution = str(parameters.get("resolution") or "").strip().lower()
+         snapshot["resolution"] = resolution or None
+@@ -236,16 +392,23 @@
+         if not isinstance(has_video, bool):
+             return _result(snapshot, reason="missing_video_input_presence")
+         branch = "with_video" if has_video else "without_video"
+-        rates = rule.get("rates", {}).get(branch, {})
++        rate_table = rule.get("rates", {})
++        if not isinstance(rate_table, dict):
++            raise ValueError("Invalid token rate table")
++        rates = rate_table.get(branch, {})
++        if not isinstance(rates, dict):
++            raise ValueError("Invalid token rates")
+         if resolution not in rates:
+             return _result(snapshot, reason="unsupported_resolution")
+         rate = _decimal(rates[resolution])
+         unit = _decimal(rule.get("token_unit"))
+         if rate is None or unit is None or unit <= 0:
+             raise ValueError("Invalid token price")
+-        snapshot.update(rate_per_million_tokens=format(rate, "f"), token_unit=format(unit, "f"))
++        snapshot.update(rate_per_million_tokens=format(rate, "f"), token_unit=format(unit, "f"),
++                        unit_price=format(rate, "f"), unit_size=format(unit, "f"))
+         tokens = _decimal(usage.get("total_tokens"))
+         snapshot["total_tokens"] = format(tokens, "f") if tokens is not None else None
++        snapshot.update(quantity=snapshot["total_tokens"], quantity_source="provider_response", quantity_field="total_tokens")
+         if tokens is None or tokens != tokens.to_integral_value():
+             return _result(snapshot, reason="missing_total_tokens" if usage.get("total_tokens") is None else "invalid_total_tokens")
+         with localcontext() as context:
+diff --git a/backend/app/core/pricing_rules.json b/backend/app/core/pricing_rules.json
+--- a/backend/app/core/pricing_rules.json
++++ b/backend/app/core/pricing_rules.json
+@@ -1,6 +1,6 @@
+ {
+   "schema_version": 1,
+-  "version": "2026-10-27.v1",
++  "version": "2026-11-02.v2",
+   "source": "user_config",
+   "rules": [
+     {
+@@ -25,6 +25,67 @@
+         "without_video": {"480p": "46", "720p": "46", "1080p": "51", "4k": "26"},
+         "with_video": {"480p": "28", "720p": "28", "1080p": "31", "4k": "16"}
+       }
++    },
++    {
++      "id": "example-image-per-image",
++      "enabled": false,
++      "_note": "模板未启用。请填写真实供应商、模型及已确认单价后，再改为 enabled: true。",
++      "kind": "unit_rate",
++      "providers": ["YOUR_PROVIDER"],
++      "call_types": ["image_generation"],
++      "models": ["YOUR_IMAGE_MODEL"],
++      "unit": "image",
++      "unit_price": "填写确认后的单价",
++      "unit_size": "1",
++      "currency": "CNY"
++    },
++    {
++      "id": "example-video-per-second",
++      "enabled": false,
++      "kind": "unit_rate",
++      "providers": ["YOUR_PROVIDER"],
++      "call_types": ["video_generation"],
++      "models": ["YOUR_VIDEO_MODEL"],
++      "unit": "second",
++      "unit_price": "填写确认后的单价",
++      "unit_size": "1",
++      "currency": "CNY"
++    },
++    {
++      "id": "example-image-per-token",
++      "enabled": false,
++      "kind": "unit_rate",
++      "providers": ["YOUR_PROVIDER"],
++      "call_types": ["image_generation"],
++      "models": ["YOUR_IMAGE_MODEL"],
++      "unit": "token",
++      "usage_field": "total_tokens",
++      "unit_price": "填写确认后的每百万 Token 单价",
++      "unit_size": "1000000",
++      "currency": "CNY"
++    },
++    {
++      "id": "example-video-per-token",
++      "enabled": false,
++      "kind": "unit_rate",
++      "providers": ["YOUR_PROVIDER"],
++      "call_types": ["video_generation"],
++      "models": ["YOUR_VIDEO_MODEL"],
++      "unit": "token",
++      "usage_field": "total_tokens",
++      "unit_price": "填写确认后的每百万 Token 单价",
++      "unit_size": "1000000",
++      "currency": "CNY"
++    },
++    {
++      "id": "example-model-provider-response",
++      "enabled": false,
++      "kind": "provider_multiplier",
++      "providers": ["YOUR_PROVIDER"],
++      "call_types": ["image_generation", "video_generation"],
++      "models": ["YOUR_MODEL"],
++      "multiplier": "填写确认后的换算系数",
++      "currency": "CNY"
+     }
+   ]
+ }
+diff --git a/backend/app/services/billing.py b/backend/app/services/billing.py
+--- a/backend/app/services/billing.py
++++ b/backend/app/services/billing.py
+@@ -26,14 +26,24 @@
+     "cache_creation_input_tokens", "reasoning_tokens", "image_tokens",
+     "text_tokens", "audio_tokens", "image_count", "images", "generated_images",
+     "video_count", "duration", "duration_seconds", "video_seconds", "seconds",
++    "video_duration", "output_duration", "output_duration_seconds",
+     "input_tokens_details", "output_tokens_details", "prompt_tokens_details",
+     "completion_tokens_details", "successful_requests",
+ })
+ _PARAMETER_FIELDS = frozenset({
+     "mode", "aspectRatio", "aspect_ratio", "imageSize", "image_size",
+-    "duration", "resolution", "ratio", "max_tokens", "stream", "image_count",
++    "duration", "duration_seconds", "resolution", "ratio", "max_tokens", "stream", "image_count", "n", "num_images",
+     "purpose", "attempt",
+     "has_video_input", "video_input_count",
++})
++_IMAGE_QUANTITY_FIELDS = ("image_count", "generated_images", "images")
++_DURATION_QUANTITY_FIELDS = (
++    "duration_seconds", "output_duration_seconds", "video_seconds",
++    "video_duration", "output_duration", "duration", "seconds",
++)
++_BILLABLE_USAGE_FIELDS = frozenset({
++    *_IMAGE_QUANTITY_FIELDS, *_DURATION_QUANTITY_FIELDS,
++    "total_tokens", "input_tokens", "output_tokens", "image_tokens",
+ })
+ 
+ 
+@@ -127,6 +137,9 @@
+         if key not in _USAGE_FIELDS:
+             continue
+         if isinstance(value, dict):
++            if key in _BILLABLE_USAGE_FIELDS:
++                result[key] = None
++                continue
+             nested = _safe_usage(value)
+             if nested:
+                 result[key] = nested
+@@ -135,13 +148,79 @@
+             if number is not None:
+                 # Preserve exact decimal strings; don't introduce binary float conversion.
+                 result[key] = value if isinstance(value, int) else number
++            elif key in _BILLABLE_USAGE_FIELDS:
++                # Present but invalid actual usage must not silently fall back
++                # to the requested count/duration. Keep a bounded sentinel,
++                # never arbitrary supplier text or a hostile decimal exponent.
++                result[key] = None
++        elif key in _BILLABLE_USAGE_FIELDS and not (
++            key in {"images", "generated_images"} and isinstance(value, list)
++        ):
++            result[key] = None
+     return result
++
++
++def _image_output_count(node: dict) -> int | None:
++    """Count recognizable image results, without storing URLs or image bytes.
++
++    Only known result-list fields are inspected. Input/reference arrays, chat
++    content, and request echoes nested under ``request`` are never traversed.
++    Provider adapters remain responsible for less conventional response shapes.
++    """
++    for key in ("images", "generated_images", "data"):
++        outputs = node.get(key)
++        if not isinstance(outputs, list):
++            continue
++        if not outputs:
++            if key in {"images", "generated_images"}:
++                return 0
++            continue
++        count = 0
++        uncertain = False
++        for item in outputs:
++            if not isinstance(item, dict) or item.get("error"):
++                continue
++            item_type = str(item.get("type") or "").lower()
++            if item_type in {"video", "video_url", "input_image", "reference_image"}:
++                continue
++            if isinstance(item.get("b64_json"), str) and item["b64_json"]:
++                count += 1
++                continue
++            url = item.get("url")
++            if not isinstance(url, str) or not url.strip():
++                continue
++            path = url.split("?", 1)[0].split("#", 1)[0].lower()
++            is_image = path.endswith((".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp"))
++            if key != "data" or item_type in {"image", "image_url", "output_image"} or is_image:
++                if not path.endswith((".mp4", ".mov", ".webm", ".mkv", ".avi")):
++                    count += 1
++            else:
++                uncertain = True
++        if count and not uncertain:
++            return count
++    return None
++
++
++def _canonical_usage(usage: dict, inferred_image_count: int | None = None) -> dict:
++    """Expose actual output quantities under stable billing field names."""
++    for field in _IMAGE_QUANTITY_FIELDS:
++        if field in usage:
++            usage["image_count"] = usage[field]
++            break
++    else:
++        if inferred_image_count is not None:
++            usage["image_count"] = inferred_image_count
++    for field in _DURATION_QUANTITY_FIELDS:
++        if field in usage:
++            usage["duration_seconds"] = usage[field]
++            break
++    return usage
+ 
+ 
+ def extract_billing(response: Any, provider: str | None = None) -> dict:
+     """Normalize explicit cost/usage fields from a raw dict or SDK response.
+ 
+-    No totals are computed from nested items. The outermost valid cost wins.
++    No monetary totals are computed from nested items. The outermost valid cost wins.
+     MiniMax and Aliyun are deliberately excluded from cost collection.
+     """
+     nodes = _response_nodes(response)
+@@ -149,6 +228,8 @@
+     currency = None
+     request_id = None
+     usage = {}
++    inferred_image_count = None
++    billing_model = None
+     for node, inherited_unit in nodes:
+         if request_id is None:
+             for key in ("request_id", "requestId", "task_id", "taskId", "id"):
+@@ -157,6 +238,10 @@
+                     request_id = str(candidate)[:512]
+                     break
+         usage.update(_safe_usage(node))
++        if inferred_image_count is None:
++            inferred_image_count = _image_output_count(node)
++        if billing_model is None and isinstance(node.get("model"), str):
++            billing_model = node["model"].strip()[:512] or None
+         if cost is None:
+             raw_cost = node.get("cost")
+             candidate = _amount(raw_cost)
+@@ -172,9 +257,9 @@
+         "cost": None if unsupported else cost,
+         "currency": None if unsupported else currency,
+         "cost_status": "not_supported" if unsupported else ("reported" if cost is not None else "unavailable"),
+-        "usage_json": usage,
++        "usage_json": _canonical_usage(usage, inferred_image_count),
+         "provider_request_id": request_id,
+-        "billing_model": str(_as_dict(response).get("model") or "")[:512] or None,
++        "billing_model": billing_model,
+     }
+ 
+ 
+@@ -199,6 +284,13 @@
+         project = db.get(Project, project_id) if project_id else None
+         call_id = uuid.uuid4().hex
+         unsupported = str(provider or "").strip().lower() in UNSUPPORTED_PROVIDERS
++        effective_parameters = _safe_parameters(parameters)
++        if call_type == "image_generation" and not any(
++            field in effective_parameters for field in ("image_count", "n", "num_images")
++        ):
++            # Current image requests are single-image requests. Actual returned
++            # counts always win; this is only the requested-quantity fallback.
++            effective_parameters["image_count"] = 1
+         row = APICall(
+             id=call_id,
+             operation_id=operation_id or uuid.uuid4().hex,
+@@ -217,7 +309,7 @@
+             currency=None,
+             cost_status="not_supported" if unsupported else "pending",
+             usage_json={},
+-            parameters_json=_safe_parameters(parameters),
++            parameters_json=effective_parameters,
+             started_at=_now(),
+         )
+         _refresh_pricing(row)
+@@ -235,7 +327,7 @@
+     metadata = metadata or {}
+     if isinstance(metadata.get("usage_json"), dict):
+         usage = dict(row.usage_json or {})
+-        usage.update(_safe_usage(metadata["usage_json"]))
++        usage.update(_canonical_usage(_safe_usage(metadata["usage_json"])))
+         row.usage_json = usage
+     request_id = metadata.get("provider_request_id")
+     if request_id is not None:
+@@ -286,6 +378,17 @@
+         row.cost = None
+         row.currency = None
+         row.cost_status = "not_supported" if result["cost_status"] == "not_supported" else "pending"
++    elif row.status != "success" and (
++        row.pricing_snapshot.get("billing_mode") == "local"
++        or row.pricing_snapshot.get("kind") in {"unit_rate", "token_rate"}
++    ):
++        # A requested quantity does not establish that a failed or interrupted
++        # generation incurred the configured local price. Preserve raw supplier
++        # evidence, but settle local rules only for successful generations.
++        row.cost = None
++        row.currency = None
++        row.cost_status = "unavailable"
++        row.pricing_snapshot = {**row.pricing_snapshot, "reason": "call_not_successful"}
+     else:
+         row.cost = result["cost"]
+         row.currency = result["currency"]
+diff --git a/backend/app/services/video_generation/base.py b/backend/app/services/video_generation/base.py
+--- a/backend/app/services/video_generation/base.py
++++ b/backend/app/services/video_generation/base.py
+@@ -34,6 +34,10 @@
+             "has_video_input": video_count > 0,
+             "video_input_count": video_count,
+         }
++        if payload.get("duration") is not None:
++            # Keep the effective requested seconds for fallback only. Actual
++            # output duration is extracted separately into usage_json.
++            self.billing_parameters["duration"] = payload["duration"]
+         self.billing_metadata["parameters_json"] = dict(self.billing_parameters)
+ 
+     def _capture_billing(self, response):
+diff --git a/frontend/src/pages/Dashboard/components/ApiUsagePanel.jsx b/frontend/src/pages/Dashboard/components/ApiUsagePanel.jsx
+--- a/frontend/src/pages/Dashboard/components/ApiUsagePanel.jsx
++++ b/frontend/src/pages/Dashboard/components/ApiUsagePanel.jsx
+@@ -9,13 +9,27 @@
+ const PAGE_SIZE = 20;
+ const CALL_TYPES = { image_generation: '图片生成', video_generation: '视频生成', agent_chat: 'Agent 对话', history_summary: '历史总结' };
+ const STATUSES = { started: '进行中', success: '成功', failed: '失败', interrupted: '已中断' };
+-const COST_STATUSES = { pending: '待获取', calculated: '已换算', reported: '供应商金额', unavailable: '待计价', not_supported: '暂不采集' };
++const COST_STATUSES = { pending: '待获取', calculated: '已计价', reported: '供应商金额', unavailable: '待计价', not_supported: '暂不采集' };
+ const PRICING_REASONS = {
+     legacy_without_pricing_rule: '旧记录未保存当时的计价规则，原始数据已保留，暂不纳入换算合计。',
+     missing_provider_cost: '供应商尚未返回原始费用。',
+     invalid_provider_cost: '供应商费用格式无效，暂不换算。',
+     missing_total_tokens: '供应商尚未返回实际 total_tokens。',
+     invalid_total_tokens: '供应商 total_tokens 格式无效，暂不计价。',
++    missing_image_count: '供应商与请求参数均未提供可用的生成张数。',
++    invalid_image_count: '生成张数格式无效，暂不计价。',
++    missing_duration: '供应商与请求参数均未提供可用的视频时长。',
++    invalid_duration: '视频时长格式无效，暂不计价。',
++    missing_duration_seconds: '供应商与请求参数均未提供可用的视频时长。',
++    invalid_duration_seconds: '视频时长格式无效，暂不计价。',
++    missing_token_usage: '供应商尚未返回本规则所需的实际 Token 用量。',
++    invalid_token_usage: '供应商返回的 Token 用量格式无效，暂不计价。',
++    missing_token_quantity: '供应商尚未返回本规则所需的实际 Token 用量。',
++    invalid_token_quantity: '供应商返回的 Token 用量格式无效，暂不计价。',
++    missing_price_variant: '当前生成条件没有匹配的单价，请管理员补充配置。',
++    no_matching_price_variant: '当前生成条件没有匹配的单价，请管理员补充配置。',
++    ambiguous_price_variant: '当前生成条件匹配到多个单价，请管理员核对配置。',
++    call_not_successful: '调用尚未成功，不按配置单价计算费用。',
+     missing_resolution: '缺少生成分辨率，暂不能匹配单价。',
+     unsupported_resolution: '当前分辨率尚未配置计价规则。',
+     missing_video_input_presence: '尚未确认实际请求是否包含视频输入。',
+@@ -55,6 +69,24 @@
+             return `${condition}；${decimalText(rule.total_tokens)} ÷ ${decimalText(rule.token_unit || '1000000')} × ${decimalText(rule.rate_per_million_tokens)} = ${result}`;
+         }
+         return `${condition}；等待供应商返回实际 total_tokens。`;
++    }
++    if (rule.kind === 'unit_rate') {
++        const unit = { image: '张', second: '秒', token: 'Token' }[rule.unit] || rule.unit || '单位';
++        const quantityName = { image: '生成张数', second: '视频时长', token: 'Token 用量' }[rule.unit] || '用量';
++        const basis = rule.quantity_source === 'request_parameters'
++            ? `供应商未返回实际${quantityName}，采用请求参数`
++            : rule.quantity_source === 'provider_response' ? `采用供应商返回的实际${quantityName}` : '等待可用用量';
++        const selectors = { ...(rule.resolution ? { resolution: rule.resolution } : {}), ...(rule.image_size ? { image_size: rule.image_size } : {}), ...(typeof rule.has_video_input === 'boolean' ? { has_video_input: rule.has_video_input } : {}), ...rule.price_conditions };
++        const selectorLabels = { resolution: '分辨率', image_size: '图片尺寸', imageSize: '图片尺寸', aspect_ratio: '宽高比', aspectRatio: '宽高比', mode: '生成模式' };
++        const condition = Object.entries(selectors).map(([key, value]) => key === 'has_video_input' && typeof value === 'boolean'
++            ? value ? '含视频输入' : '不含视频输入'
++            : `${selectorLabels[key] || key}：${typeof value === 'boolean' ? value ? '是' : '否' : value}`).join(' · ');
++        const prefix = `${condition ? `${condition}；` : ''}${basis}`;
++        if (rule.unit_price == null) return `${prefix}；等待匹配单价。`;
++        const unitSize = rule.unit_size ?? '1';
++        const price = `${decimalText(rule.unit_price)} ${rule.currency || rule.rule?.currency || record.currency || '（币种未标注）'} / ${decimalText(unitSize)} ${unit}`;
++        if (rule.quantity == null) return `${prefix}；单价 ${price}。`;
++        return `${prefix}；单价 ${price}；${decimalText(rule.quantity)} ${unit} ÷ ${decimalText(unitSize)} × ${decimalText(rule.unit_price)} = ${result}`;
+     }
+     if (rule.kind === 'provider_reported') return '使用供应商返回的原始金额及单位，未作人民币换算。';
+     return null;
+@@ -120,7 +152,7 @@
+                 </dl>
+                 {explanation && <p className="mt-3 break-all leading-relaxed text-neutral-300">{explanation}</p>}
+                 {rule?.reason && <p className="mt-3 leading-relaxed text-amber-200/80">{PRICING_REASONS[rule.reason] || '计价信息不足，请结合规则快照核对。'}</p>}
+-                {record.cost_status === 'calculated' && <p className="mt-2 leading-relaxed text-neutral-500">根据本次保存的规则换算，便于成本统计；金额仍需与供应商账单核对。</p>}
++                {record.cost_status === 'calculated' && <p className="mt-2 leading-relaxed text-neutral-500">根据本次保存的规则计算费用；用量来源和计算过程见上方说明。</p>}
+             </div>
+             <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 xl:grid-cols-3">
+                 {details.map(([label, value]) => (
+@@ -306,7 +338,7 @@
+                                 </div>
+                                 <div className="flex items-center justify-between border-t border-white/10 px-4 py-3 text-xs text-neutral-500"><span>每页 {PAGE_SIZE} 条 · 第 {page} / {totalPages} 页</span><div className="flex gap-2"><button type="button" onClick={() => changePage(page - 1)} disabled={page <= 1} aria-label="上一页" className="rounded-lg border border-white/10 p-2 hover:text-white disabled:opacity-30"><ChevronLeft size={15} /></button><button type="button" onClick={() => changePage(page + 1)} disabled={page >= totalPages} aria-label="下一页" className="rounded-lg border border-white/10 p-2 hover:text-white disabled:opacity-30"><ChevronRight size={15} /></button></div></div>
+                             </section>
+-                            <p className="text-xs leading-relaxed text-neutral-600">zhenzhen 按原始费用与配置系数换算；火山与 poxian 的 Seedance 2.0 按实际 Token、分辨率及视频输入规则计价。没有匹配规则或必要用量时保留空值；MiniMax 与阿里云暂不计价。规则换算结果用于成本统计，仍需与供应商账单核对。</p>
++                            <p className="text-xs leading-relaxed text-neutral-600">按供应商与模型配置计价规则，支持按张、按秒、按 Token 或读取供应商费用。按张、按秒优先使用实际结果，缺失时采用请求参数；Token 使用实际用量。没有匹配规则或必要用量时保留空值。</p>
+                         </>
+                     )}
+                 </div>
+diff --git a/backend/API_COSTS.md b/backend/API_COSTS.md
+--- a/backend/API_COSTS.md
++++ b/backend/API_COSTS.md
+@@ -1,4 +1,6 @@
+ # API 调用与人民币成本统计（规则版）
++
++2026-11-02 已扩展为供应商、模型独立配置：图片支持按张或 Token，视频支持按秒或 Token，也可读取供应商返回金额。完整配置及本次部署步骤见 [PRICING_RULES.md](PRICING_RULES.md)。本次扩展不新增数据库迁移；下文的旧版迁移步骤仅适用于尚未安装计价快照字段的项目。
+ 
+ 使用现有 SQLite；记录真实调用用户、项目、供应商、模型、任务状态及原始用量。数据面板和统计接口仅 admin 可访问。
+ 
+@@ -45,7 +47,7 @@
+ 
+ 供应商成功后先保存费用再下载文件，下载失败不会抹掉上游生成费用。视频轮询只更新同一条调用记录。原始金额和换算金额分别保存，重复回调不会重复乘以 1.35。
+ 
+-## 更新步骤（已安装上一版费用功能）
++## 2026-10-27 计价快照版本的更新步骤（历史说明）
+ 
+ 1. 停止后端，备份当前 SQLite 数据库。把更新包内 backend 和 frontend 的文件复制到项目相同路径。
+ 2. 在 backend 的原虚拟环境执行 `alembic upgrade head`，新增原始金额、返回模型及规则快照字段，然后重启后端。
+diff --git a/backend/PRICING_RULES.md b/backend/PRICING_RULES.md
+new file mode 100644
+--- /dev/null
++++ b/backend/PRICING_RULES.md
+@@ -0,0 +1,126 @@
++# 按供应商、模型配置 API 计价规则
++
++## 本次约定
++
++规则继续维护在 `app/core/pricing_rules.json`，不新增配置页面。费用计算和保存都在后端，前端只展示计价结果、用量来源和公式。
++
++每条规则指定供应商、模型、调用类型，以及使用哪种金额来源：
++
++| 配置 | 含义 | 最终计算 |
++| --- | --- | --- |
++| `kind: unit_rate`、`unit: image` | 图片按张 | 张数 ÷ unit_size × unit_price |
++| `kind: unit_rate`、`unit: second` | 视频按秒 | 秒数 ÷ unit_size × unit_price |
++| `kind: unit_rate`、`unit: token` | 图片或视频按 Token | 实际 Token ÷ unit_size × unit_price |
++| `kind: provider_multiplier` | 从供应商响应提取原始金额 | provider_cost × multiplier |
++| `kind: token_rate` | 兼容原有 Seedance 2.0 分辨率与视频输入矩阵 | total_tokens ÷ token_unit × 对应单价 |
++
++这里的“前算”指提前配置单价，在生成成功后结算。不会在请求发出时把预估金额当作实际花费。
++
++一条调用只使用选中的一种计价规则。选择本地计算时，即使响应里有 cost，也只保留为原始证据，不覆盖本地结果；选择读取供应商金额时，没有 cost 就保持待获取，不自动切换到本地价格。
++
++## 已保留的默认价格
++
++- zhenzhen、zhenzhen-gpt、zhenzhen-gemini：供应商返回金额乘以 1.35，输出 CNY。
++- volcengine、poxian 的 Seedance 2.0：保留此前已确认的 Token 单价矩阵及 poxian endpoint 别名。
++- MiniMax、Aliyun/ali：继续为空，暂不计价。
++- 未配置供应商仍兼容旧版的供应商原始金额透传，币种缺失时不会假定人民币；正式使用新供应商前建议明确配置规则。
++
++本次没有新增真实模型的单价。配置末尾有五个 `enabled: false` 模板，单价和模型均为占位内容；模板默认不参与匹配。
++
++## 如何为模型启用规则
++
++1. 在 rules 中复制对应模板，为 id 填写一个唯一名称。
++2. 填写真实 providers、models 和 call_types。providers 使用代码中的供应商标识，例如 zhenzhen、volcengine、poxian。
++3. 填写已经确认的 unit_price 或 multiplier、币种，以及计价单位。
++4. 将该规则的 enabled 改为 true，并更新配置顶层 version。
++5. 校验 JSON 格式后，让该模型产生一条新调用，在管理员明细核对规则和公式。
++
++金额及换算系数建议使用 JSON 字符串，例如 `"0.20"`。unit_size 表示该单价对应多少计价单位：每张或每秒使用 `"1"`，每百万 Token 使用 `"1000000"`。模板中的中文占位单价必须替换后才能启用。
++
++修改已部署的 JSON 会作用于后续新调用；进行中的调用继续使用开始时保存的规则。代码更新后仍需按部署方式重启后端。若使用环境变量 API_COST_PRICING_RULES_FILE 指向外部配置文件，需要修改该文件。
++
++## 模型匹配与覆盖
++
++- models：精确模型名列表，通常最容易维护。
++- model_patterns：完整匹配模型名的正则，适合明确的版本命名规则。
++- model_aliases：按供应商配置 endpoint 别名，沿用原来的 poxian 配置方式。
++- 不写模型条件的规则是该供应商的通用默认规则。具体模型规则优先于这个默认规则，与文件排列顺序无关。
++- 同样具体的规则同时命中会保持待计价并提示配置无效，不随机选一条。同样具体的条件单价重复命中也会提示配置无效。
++- 供应商返回明确的实际模型名时，以实际模型匹配；请求别名与实际模型名称不一致时，需要将对应名称纳入同一条规则。未知 endpoint 不能随便套用相似模型价格。
++
++例如 zhenzhen 保留通用的 cost × 1.35 规则，同时可为某个图片模型增加 models 专属的按张规则。该模型匹配后使用按张计算，其他 zhenzhen 模型继续读取返回金额。
++
++新增 Seedance 2.5 时应新增独立模型规则及其已确认单价，不扩大 2.0 的匹配范围。旧版 token_rate 继续兼容，也可以为新模型直接使用 unit_rate + token。
++
++## 分辨率等条件单价
++
++unit_rate 可以通过 price_variants 指定条件价格。以下只是未启用的结构模板，没有可用真实单价：
++
++```json
++{
++  "id": "example-image-resolution-price",
++  "enabled": false,
++  "kind": "unit_rate",
++  "providers": ["zhenzhen"],
++  "call_types": ["image_generation"],
++  "models": ["YOUR_IMAGE_MODEL"],
++  "unit": "image",
++  "unit_size": "1",
++  "currency": "CNY",
++  "price_variants": [
++    {"when": {"image_size": "2K"}, "unit_price": "填写确认后的2K每张单价"},
++    {"when": {"image_size": "4K"}, "unit_price": "填写确认后的4K每张单价"}
++  ]
++}
++```
++
++条件匹配使用保存的生成参数，例如 image_size、resolution、has_video_input、mode。字符串忽略大小写，布尔值使用 JSON 的 true/false。条件更多的匹配项优先；相同具体程度同时命中视为冲突。若规则顶层提供 unit_price，它作为没有任何条件命中时的默认单价；没有默认单价则保持待计价。
++
++当前视频适配器会保存实际发出的分辨率、时长和视频引用数量；返回的实际分辨率可修正分辨率条件。不要把输入参考图片张数或参考视频时长当作生成结果数量。
++
++## 实际数量与请求参数
++
++- 按张：优先使用实际生成的图片数量；没有实际数量时使用本次请求数量。现有图片任务没有批量数量参数时，保存请求数量为 1；已有供应商适配器会用实际返回 URL 数量补充生成张数。
++- 按秒：优先使用响应中的实际输出时长；缺失时使用发给供应商的 duration。输出时长存入 usage_json.duration_seconds，请求时长保留在 parameters_json.duration，二者分开。
++- 按 Token：默认使用实际返回的 total_tokens；可用 usage_field 指定其他已采集的实际 Token 字段，也支持点号路径。不能用 max_tokens 预算代替实际消耗，缺少实际 Token 时保持待计价。
++- 供应商明确返回 0 时，0 是有效实际数量，不回退请求参数。
++- 实际数量存在但格式无效时，保留待计价并显示原因，不用请求值掩盖问题。
++- 本地按单价计算只对成功生成结算。失败、中断或等待中的任务不会根据请求张数、时长生成费用。上游成功后本地文件下载失败，仍保留已发生的生成费用。
++
++自动提取仅检查明确的用量字段和已识别的结果结构，不扫描提示词、参考素材或请求回显。新供应商如果使用完全不同的响应结构，除配置价格外，还需在其适配器中提供标准化的实际用量或 cost。
++
++## 保存与兼容
++
++沿用现有 api_call_records 表，不新增字段：provider_cost 保存供应商原始金额，cost 保存最终金额，usage_json 保存实际用量，parameters_json 保存请求参数，pricing_snapshot 保存选中的规则、公式、计价数量及其来源。
++
++新调用保存完整的配置快照。后续价格、规则或模型目录修改不会重新定价已经开始的调用；实际模型晚到时仍在原来的配置快照中选规则。旧版只保存单条规则的快照继续使用原规则。开始时配置文件损坏或缺失的调用保持待计价，不在修复后自动套用新的价格。
++
++重复轮询和完成通知更新同一条调用记录，不重复生成金额、不重复乘 1.35，也不自动重算历史调用。原来标记 legacy_without_pricing_rule 的旧数据继续保持原处理方式。
++
++管理员权限限制保持不变。页面继续只保留筛选、费用合计和调用明细；不恢复四个统计卡片或按用户、按模型分组展示。明细新增张数、秒数、Token 公式和“实际返回 / 请求参数”来源说明。
++
++## 本次部署
++
++前提：已经安装原 API 费用功能及上一版计价快照字段，后端已注册 /api/admin/api-calls 和 /api/admin/api-calls/summary。此包不是首次安装完整包，不包含整个应用和路由注册。
++
++1. 保存现有代码和自定义 pricing_rules.json。如果已经改过价格，将这些规则合并到新文件，避免直接覆盖后丢失自定义内容。
++2. 将更新包中的 backend、frontend 文件复制到项目相同路径。
++3. 使用原进程管理方式重启后端。本次不新增依赖和迁移，不需要为本次更新执行 alembic upgrade。
++4. 开发模式刷新页面；正式部署在 frontend 执行 npm run build，然后按原方式更新 dist。
++5. 管理员发起新调用，核对费用明细的规则 ID、实际用量或请求回退来源，以及最终金额。
++
++JSON 格式校验（backend 目录）：
++
++```bash
++python -m json.tool app/core/pricing_rules.json > /dev/null
++```
++
++Windows PowerShell 可去掉重定向，或将 > /dev/null 换成 > $null。
++
++后端相关测试（backend 目录、原虚拟环境）：
++
++```bash
++python -m pytest tests/test_pricing.py tests/test_unit_pricing.py tests/test_billing_service.py tests/test_billing_quantities.py tests/test_video_pricing_context.py -q
++```
++
++测试使用模拟响应和临时数据库，不调用付费模型接口。新供应商上线时仍应使用其实际响应核对字段与计费口径。
+diff --git a/backend/tests/test_unit_pricing.py b/backend/tests/test_unit_pricing.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/test_unit_pricing.py
+@@ -0,0 +1,272 @@
++"""Independent platform/model rules and the source of billable quantities."""
++from copy import deepcopy
++from decimal import Decimal
++
++import pytest
++
++from app.services import pricing
++
++
++def unit_rule(unit="image", **overrides):
++    result = {
++        "id": f"test-{unit}", "kind": "unit_rate", "providers": ["zhenzhen"],
++        "models": ["test-model"],
++        "call_types": ["video_generation" if unit == "second" else "image_generation"],
++        "unit": unit, "unit_price": "0.25", "unit_size": "1", "currency": "CNY",
++    }
++    result.update(overrides)
++    return result
++
++
++def use_rules(monkeypatch, *rules):
++    policy = {"schema_version": 1, "version": "unit-test-v1", "source": "user_config",
++              "policy_hash": "frozen-test-policy", "rules": list(rules)}
++    monkeypatch.setattr(pricing, "load_pricing_rules", lambda: deepcopy(policy))
++    return policy
++
++
++def calculate(**overrides):
++    values = {"provider": "zhenzhen", "model": "test-model", "call_type": "image_generation",
++              "parameters": {"image_count": 3}, "usage": {}}
++    values.update(overrides)
++    return pricing.calculate_cost(**values)
++
++
++@pytest.mark.parametrize("unit,call_type,usage,parameters,expected", [
++    ("image", "image_generation", {"image_count": 2}, {"image_count": 3}, "0.50"),
++    ("second", "video_generation", {"duration_seconds": "4.5"}, {"duration": 10}, "1.125"),
++    ("token", "image_generation", {"total_tokens": 8000}, {"max_tokens": 10000}, "2000.00"),
++    ("token", "video_generation", {"total_tokens": 8000}, {"duration": 10}, "2000.00"),
++])
++def test_units_use_actual_output(monkeypatch, unit, call_type, usage, parameters, expected):
++    use_rules(monkeypatch, unit_rule(unit, call_types=[call_type]))
++    result = calculate(call_type=call_type, usage=usage, parameters=parameters, provider_cost="999")
++    assert result["cost"] == expected
++    assert result["currency"] == "CNY"
++    snapshot = result["pricing_snapshot"]
++    assert snapshot["billing_mode"] == "local"
++    assert snapshot["unit"] == unit
++    assert snapshot["quantity_source"] == "provider_response"
++    assert snapshot["formula"] == "quantity / unit_size * unit_price"
++
++
++@pytest.mark.parametrize("unit,call_type,parameters,expected", [
++    ("image", "image_generation", {"image_count": 3}, "0.75"),
++    ("image", "image_generation", {"n": 4}, "1.00"),
++    ("image", "image_generation", {"num_images": 2}, "0.50"),
++    ("second", "video_generation", {"duration": "7.5"}, "1.875"),
++    ("second", "video_generation", {"duration_seconds": 8}, "2.00"),
++])
++def test_request_quantity_is_used_only_when_response_omits_it(monkeypatch, unit, call_type, parameters, expected):
++    use_rules(monkeypatch, unit_rule(unit))
++    result = calculate(call_type=call_type, parameters=parameters)
++    assert result["cost"] == expected
++    assert result["pricing_snapshot"]["quantity_source"] == "request_parameters"
++
++
++@pytest.mark.parametrize("unit,field,call_type", [
++    ("image", "image_count", "image_generation"),
++    ("second", "duration_seconds", "video_generation"),
++    ("token", "total_tokens", "image_generation"),
++])
++def test_actual_zero_is_billable_zero_and_never_falls_back(monkeypatch, unit, field, call_type):
++    use_rules(monkeypatch, unit_rule(unit))
++    result = calculate(call_type=call_type, usage={field: 0}, parameters={field: 100, "duration": 100})
++    assert Decimal(result["cost"]) == 0
++    assert result["cost_status"] == "calculated"
++    assert result["pricing_snapshot"]["quantity_source"] == "provider_response"
++
++
++@pytest.mark.parametrize("value", [None, True, -1, "bad", "NaN", "Infinity", "1e99999", "1.5"])
++def test_invalid_actual_image_count_never_uses_requested_count(monkeypatch, value):
++    use_rules(monkeypatch, unit_rule())
++    result = calculate(usage={"image_count": value})
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "invalid_image_count"
++    assert result["pricing_snapshot"]["quantity_source"] == "provider_response"
++
++
++def test_tokens_are_actual_only_not_request_budgets_or_duration(monkeypatch):
++    use_rules(monkeypatch, unit_rule("token", unit_price="12", unit_size="1000000"))
++    result = calculate(parameters={"total_tokens": 10000, "max_tokens": 10000, "duration": 5})
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "missing_token_quantity"
++    assert calculate(usage={"total_tokens": 10000})["cost"] == "0.12"
++
++
++@pytest.mark.parametrize("field,usage", [
++    ("output_tokens", {"output_tokens": 2000, "total_tokens": 9000}),
++    ("output_tokens_details.image_tokens", {"output_tokens_details": {"image_tokens": 2000}}),
++])
++def test_token_field_can_be_declared(monkeypatch, field, usage):
++    use_rules(monkeypatch, unit_rule("token", usage_field=field, unit_price="10", unit_size="1000000"))
++    result = calculate(usage=usage)
++    assert result["cost"] == "0.020"
++    assert result["pricing_snapshot"]["quantity_field"] == field
++
++
++@pytest.mark.parametrize("reverse", [False, True])
++def test_model_override_wins_over_provider_default_in_either_order(monkeypatch, reverse):
++    fallback = {"id": "provider-default", "kind": "provider_multiplier", "providers": ["zhenzhen"],
++                "multiplier": "1.35", "currency": "CNY"}
++    rules = [fallback, unit_rule()]
++    use_rules(monkeypatch, *(reversed(rules) if reverse else rules))
++    result = calculate(provider_cost="100")
++    assert result["cost"] == "0.75"
++    assert result["pricing_snapshot"]["rule_id"] == "test-image"
++    assert calculate(model="other-model", provider_cost="2")["cost"] == "2.70"
++
++
++def test_missing_response_amount_does_not_silently_switch_to_local_calculation(monkeypatch):
++    response_rule = {"id": "response-only", "kind": "provider_multiplier", "providers": ["zhenzhen"],
++                     "models": ["test-model"], "multiplier": "1.35", "currency": "CNY"}
++    use_rules(monkeypatch, response_rule)
++    result = calculate(usage={"image_count": 3})
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "missing_provider_cost"
++    assert result["pricing_snapshot"]["billing_mode"] == "provider_reported"
++
++
++def test_ambiguous_model_rules_fail_without_falling_back(monkeypatch):
++    use_rules(monkeypatch, unit_rule(), unit_rule(id="duplicate", unit_price="99"))
++    result = calculate(provider_cost="100")
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "invalid_pricing_config"
++
++
++def test_disabled_examples_never_change_price_or_validate_placeholder_amount(monkeypatch):
++    disabled = unit_rule(enabled=False, unit_price="填写确认后的单价")
++    fallback = {"id": "provider-default", "kind": "provider_multiplier", "providers": ["zhenzhen"],
++                "multiplier": "1.35", "currency": "CNY"}
++    use_rules(monkeypatch, fallback, disabled)
++    assert calculate(provider_cost="2")["cost"] == "2.70"
++
++
++def test_actual_model_can_select_override_from_original_frozen_catalogue(monkeypatch):
++    fallback = {"id": "provider-default", "kind": "provider_multiplier", "providers": ["zhenzhen"],
++                "multiplier": "1.35", "currency": "CNY"}
++    use_rules(monkeypatch, fallback, unit_rule())
++    first = calculate(model="ep-unknown")
++    assert first["pricing_snapshot"]["rule_id"] == "provider-default"
++    def no_new_prices():
++        raise AssertionError("Existing calls must only consult frozen rules")
++    monkeypatch.setattr(pricing, "load_pricing_rules", no_new_prices)
++    final = calculate(model="ep-unknown", billing_model="test-model", provider_cost="100",
++                      rule_snapshot=first["pricing_snapshot"])
++    assert final["cost"] == "0.75"
++    assert final["pricing_snapshot"]["rule_id"] == "test-image"
++
++
++def test_edited_or_new_rules_do_not_reprice_inflight_calls(monkeypatch):
++    original = unit_rule()
++    policy = use_rules(monkeypatch, original)
++    first = calculate(usage={})
++    policy["rules"][0]["unit_price"] = "999"
++    final = calculate(usage={"image_count": 2}, rule_snapshot=first["pricing_snapshot"])
++    assert final["cost"] == "0.50"
++    assert calculate(usage={"image_count": 2})["cost"] == "1998"
++
++
++def test_legacy_rule_only_snapshot_still_freezes_amount(monkeypatch):
++    use_rules(monkeypatch, unit_rule())
++    first = calculate()
++    frozen = first["pricing_snapshot"]
++    del frozen["policy"]
++    use_rules(monkeypatch, unit_rule(unit_price="999"))
++    assert calculate(rule_snapshot=frozen)["cost"] == "0.75"
++
++
++def test_returned_model_conflict_cannot_reuse_requested_models_unit_price(monkeypatch):
++    use_rules(monkeypatch, unit_rule())
++    assert calculate(billing_model="future-model")["cost"] is None
++
++
++def test_response_rule_supports_exact_models_and_aliases(monkeypatch):
++    rule = {"id": "specific-response", "kind": "provider_multiplier", "providers": ["zhenzhen"],
++            "models": ["Test-Model"], "model_aliases": {"zhenzhen": ["ep-my-model"]},
++            "multiplier": "1.35", "currency": "CNY"}
++    use_rules(monkeypatch, rule)
++    assert calculate(model="zhenzhen-test-model", provider_cost="2")["cost"] == "2.70"
++    assert calculate(model="ep-my-model", provider_cost="2")["cost"] == "2.70"
++    assert calculate(model="different", provider_cost="2")["cost"] is None
++
++
++def test_price_variants_select_actual_parameters_and_most_specific_match(monkeypatch):
++    variants = [
++        {"when": {"resolution": "720p"}, "unit_price": "0.2"},
++        {"when": {"resolution": "720p", "has_video_input": True}, "unit_price": "0.3"},
++    ]
++    use_rules(monkeypatch, unit_rule("second", unit_price="0.1", price_variants=variants))
++    result = calculate(call_type="video_generation", parameters={"resolution": "720P", "has_video_input": True, "duration": 5})
++    assert result["cost"] == "1.5"
++    assert result["pricing_snapshot"]["price_conditions"] == {"resolution": "720p", "has_video_input": True}
++    assert calculate(call_type="video_generation", parameters={"resolution": "1080p", "duration": 5})["cost"] == "0.5"
++
++
++def test_price_variants_without_default_require_a_match(monkeypatch):
++    rule = unit_rule(price_variants=[{"when": {"image_size": "2K"}, "unit_price": "0.5"}])
++    del rule["unit_price"]
++    use_rules(monkeypatch, rule)
++    result = calculate(parameters={"image_count": 2, "image_size": "4K"})
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "no_matching_price_variant"
++    assert calculate(parameters={"image_count": 2, "image_size": "2k"})["cost"] == "1.0"
++
++
++def test_ambiguous_price_variants_do_not_pick_list_order(monkeypatch):
++    use_rules(monkeypatch, unit_rule(price_variants=[
++        {"when": {"image_size": "2K"}, "unit_price": "0.5"},
++        {"when": {"aspect_ratio": "16:9"}, "unit_price": "0.8"},
++    ]))
++    result = calculate(parameters={"image_count": 2, "image_size": "2K", "aspect_ratio": "16:9"})
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "invalid_pricing_config"
++
++
++@pytest.mark.parametrize("unit_price,unit_size", [("bad", "1"), ("1", "0"), ("-1", "1"), ("1", True)])
++def test_invalid_price_never_becomes_a_free_call(monkeypatch, unit_price, unit_size):
++    use_rules(monkeypatch, unit_rule(unit_price=unit_price, unit_size=unit_size))
++    result = calculate()
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "invalid_pricing_config"
++
++
++def test_actual_quantities_aliases_work_without_canonical_fields(monkeypatch):
++    use_rules(monkeypatch, unit_rule())
++    assert calculate(usage={"generated_images": 2})["cost"] == "0.50"
++    use_rules(monkeypatch, unit_rule("second"))
++    assert calculate(call_type="video_generation", usage={"video_seconds": "3.5"})["cost"] == "0.875"
++
++
++@pytest.mark.parametrize("overrides", [
++    {"model_aliases": []}, {"model_aliases": {"zhenzhen": "not-a-list"}},
++    {"model_patterns": "not-a-list"}, {"models": {"bad": "type"}},
++    {"enabled": "false"}, {"price_variants": [{"when": {"resolution": {}}, "unit_price": "1"}]},
++])
++def test_bad_nested_manual_configuration_stays_unpriced(monkeypatch, overrides):
++    use_rules(monkeypatch, unit_rule(**overrides))
++    result = calculate()
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "invalid_pricing_config"
++
++
++@pytest.mark.parametrize("rates", [[], {"without_video": []}])
++def test_bad_legacy_token_rate_table_does_not_raise(monkeypatch, rates):
++    rule = {"id": "bad-rates", "kind": "token_rate", "providers": ["zhenzhen"],
++            "models": ["test-model"], "token_unit": "1000000", "currency": "CNY", "rates": rates}
++    use_rules(monkeypatch, rule)
++    result = calculate(parameters={"resolution": "720p", "has_video_input": False}, usage={"total_tokens": 10})
++    assert result["cost"] is None
++    assert result["pricing_snapshot"]["reason"] == "invalid_pricing_config"
++
++
++def test_fixing_invalid_starting_policy_does_not_price_existing_call(monkeypatch):
++    def missing_configuration():
++        raise OSError("Pricing file is unavailable")
++    monkeypatch.setattr(pricing, "load_pricing_rules", missing_configuration)
++    first = calculate()
++    assert first["cost"] is None
++    assert "policy" not in first["pricing_snapshot"]
++    use_rules(monkeypatch, unit_rule())
++    assert calculate(rule_snapshot=first["pricing_snapshot"])["cost"] is None
++    assert calculate()["cost"] == "0.75"
+diff --git a/backend/tests/test_billing_quantities.py b/backend/tests/test_billing_quantities.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/test_billing_quantities.py
+@@ -0,0 +1,230 @@
++"""Actual output evidence and successful settlement for configurable unit prices."""
++from copy import deepcopy
++from decimal import Decimal
++
++import pytest
++from sqlalchemy import create_engine
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.models.domain import APICall, Base
++from app.services import billing, pricing
++
++
++@pytest.fixture
++def quantity_db(monkeypatch):
++    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
++    Base.metadata.create_all(engine)
++    sessions = sessionmaker(bind=engine)
++    monkeypatch.setattr(billing, "SessionLocal", sessions)
++    yield sessions
++    engine.dispose()
++
++
++@pytest.fixture
++def unit_policy(monkeypatch):
++    policy = {
++        "schema_version": 1, "version": "quantity-tests", "policy_hash": "quantity-test-policy",
++        "rules": [
++            {
++                "id": "image-local", "kind": "unit_rate", "providers": ["example"],
++                "models": ["image-model"], "call_types": ["image_generation"],
++                "unit": "image", "unit_price": "0.40", "unit_size": "1", "currency": "CNY",
++            },
++            {
++                "id": "video-local", "kind": "unit_rate", "providers": ["example"],
++                "models": ["video-model"], "call_types": ["video_generation"],
++                "unit": "second", "unit_price": "0.25", "unit_size": "1", "currency": "CNY",
++            },
++            {
++                "id": "reported-default", "kind": "provider_multiplier", "providers": ["reported"],
++                "multiplier": "1.35", "currency": "CNY",
++            },
++        ],
++    }
++    monkeypatch.setattr(pricing, "load_pricing_rules", lambda: deepcopy(policy))
++    return policy
++
++
++def begin_image(**overrides):
++    values = dict(user_id=None, project_id=None, provider="example", model="image-model", call_type="image_generation")
++    values.update(overrides)
++    return billing.begin_call(**values)
++
++
++def begin_video(**overrides):
++    values = dict(user_id=None, project_id=None, provider="example", model="video-model", call_type="video_generation", parameters={"duration": 5})
++    values.update(overrides)
++    return billing.begin_call(**values)
++
++
++def test_nested_actual_duration_and_model_are_normalized():
++    metadata = billing.extract_billing({"data": {"model": "video-actual", "output": {"duration": "7.5"}}})
++    assert metadata["usage_json"] == {"duration": "7.5", "duration_seconds": "7.5"}
++    assert metadata["billing_model"] == "video-actual"
++
++
++def test_explicit_usage_zero_is_actual_evidence():
++    metadata = billing.extract_billing({"usage": {"image_count": 0, "duration_seconds": 0}})
++    assert metadata["usage_json"]["image_count"] == 0
++    assert metadata["usage_json"]["duration_seconds"] == 0
++
++
++@pytest.mark.parametrize("field", ["images", "generated_images"])
++def test_explicit_empty_image_output_array_is_zero(field):
++    metadata = billing.extract_billing({"output": {field: []}})
++    assert metadata["usage_json"]["image_count"] == 0
++
++
++@pytest.mark.parametrize("field", ["image_count", "duration", "duration_seconds", "total_tokens"])
++@pytest.mark.parametrize("value", [False, "NaN", -1, "1e999999", {"prompt": "private"}])
++def test_invalid_actual_quantity_is_a_bounded_sentinel(field, value):
++    metadata = billing.extract_billing({"usage": {field: value}})
++    assert metadata["usage_json"][field] is None
++    assert "private" not in str(metadata)
++
++
++def test_counts_only_recognizable_successful_image_outputs():
++    metadata = billing.extract_billing({"data": [
++        {"url": "https://example.invalid/result.png"},
++        {"b64_json": "private-image-bytes"},
++        {"error": {"message": "generation failed"}},
++    ]})
++    assert metadata["usage_json"]["image_count"] == 2
++    assert "result.png" not in str(metadata)
++    assert "private-image-bytes" not in str(metadata)
++
++
++def test_does_not_count_input_references_chat_content_or_videos():
++    metadata = billing.extract_billing({
++        "input_images": [{"url": "https://example.invalid/input.png"}],
++        "request": {"images": [{"url": "https://example.invalid/reference.png"}]},
++        "content": {"images": [{"url": "https://example.invalid/another.png"}]},
++        "data": [{"type": "video", "url": "https://example.invalid/video.mp4"}],
++    })
++    assert "image_count" not in metadata["usage_json"]
++
++
++def test_explicit_actual_count_takes_precedence_over_inferred_list():
++    metadata = billing.extract_billing({
++        "data": [{"url": "https://example.invalid/result.png"}],
++        "usage": {"image_count": 3},
++    })
++    assert metadata["usage_json"]["image_count"] == 3
++
++
++def test_single_image_request_gets_fallback_but_does_not_settle_early(quantity_db, unit_policy):
++    call_id = begin_image()
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.parameters_json["image_count"] == 1
++        assert row.usage_json == {}
++        assert row.cost is None
++        assert row.cost_status == "pending"
++
++
++def test_explicit_requested_count_is_not_overridden_by_single_image_default(quantity_db, unit_policy):
++    call_id = begin_image(parameters={"n": 3})
++    billing.finish_call(call_id)
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.parameters_json == {"n": 3}
++        assert Decimal(row.cost) == Decimal("1.20")
++        assert row.pricing_snapshot["quantity_source"] == "request_parameters"
++
++
++def test_actual_image_count_wins_over_requested_and_raw_cost(quantity_db, unit_policy):
++    call_id = begin_image(parameters={"image_count": 1})
++    billing.finish_call(call_id, response={"cost": "99", "usage": {"image_count": 2}})
++    billing.finish_call(call_id)
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert Decimal(row.cost) == Decimal("0.80")
++        assert row.provider_cost == "99"
++        assert row.parameters_json["image_count"] == 1
++        assert row.usage_json["image_count"] == 2
++        assert row.pricing_snapshot["quantity_source"] == "provider_response"
++        assert db.query(APICall).count() == 1
++
++
++def test_actual_video_duration_wins_without_replacing_requested_duration(quantity_db, unit_policy):
++    call_id = begin_video()
++    billing.finish_call(call_id, response={"output": {"duration": "7.5"}})
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.parameters_json["duration"] == 5
++        assert row.usage_json["duration_seconds"] == "7.5"
++        assert Decimal(row.cost) == Decimal("1.875")
++        assert row.pricing_snapshot["quantity_source"] == "provider_response"
++
++
++@pytest.mark.parametrize("kind,expected", [("image", "0.40"), ("video", "1.25")])
++def test_successful_call_falls_back_to_requested_quantity(quantity_db, unit_policy, kind, expected):
++    call_id = begin_image() if kind == "image" else begin_video()
++    billing.finish_call(call_id)
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert Decimal(row.cost) == Decimal(expected)
++        assert row.pricing_snapshot["quantity_source"] == "request_parameters"
++
++
++@pytest.mark.parametrize("status", ["failed", "interrupted"])
++@pytest.mark.parametrize("kind", ["image", "video"])
++def test_local_prices_never_settle_unsuccessful_calls(quantity_db, unit_policy, status, kind):
++    call_id = begin_image() if kind == "image" else begin_video()
++    billing.finish_call(call_id, status=status, response={"cost": "99"})
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.cost is None
++        assert row.currency is None
++        assert row.cost_status == "unavailable"
++        assert row.provider_cost == "99"
++        assert row.pricing_snapshot["reason"] == "call_not_successful"
++
++
++def test_reported_mode_without_amount_does_not_fall_back_to_quantity(quantity_db, unit_policy):
++    call_id = begin_image(provider="reported", parameters={"image_count": 3})
++    billing.finish_call(call_id, response={"usage": {"image_count": 2}})
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.cost is None
++        assert row.cost_status == "unavailable"
++        assert row.pricing_snapshot["reason"] == "missing_provider_cost"
++
++
++def test_reported_raw_evidence_on_failure_preserves_previous_behavior(quantity_db, unit_policy):
++    call_id = begin_image(provider="reported")
++    billing.finish_call(call_id, status="failed", response={"cost": "2"})
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert Decimal(row.cost) == Decimal("2.70")
++        assert row.provider_cost == "2"
++
++
++def test_inflight_local_rule_is_frozen_until_actual_quantity_arrives(quantity_db, unit_policy):
++    call_id = begin_image()
++    unit_policy["rules"][0]["unit_price"] = "99"
++    billing.finish_call(call_id, response={"usage": {"image_count": 2}})
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert Decimal(row.cost) == Decimal("0.80")
++
++
++def test_invalid_actual_quantity_cannot_be_hidden_by_request_fallback(quantity_db, unit_policy):
++    call_id = begin_image()
++    billing.finish_call(call_id, response={"usage": {"image_count": "NaN"}})
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.usage_json["image_count"] is None
++        assert row.cost is None
++        assert row.cost_status == "unavailable"
++
++
++def test_actual_metadata_alias_updates_replace_earlier_observation(quantity_db, unit_policy):
++    call_id = begin_video()
++    billing.update_call(call_id, metadata={"usage_json": {"duration": 7}})
++    billing.finish_call(call_id, metadata={"usage_json": {"duration": 8}})
++    with quantity_db() as db:
++        row = db.get(APICall, call_id)
++        assert row.usage_json["duration_seconds"] == 8
++        assert Decimal(row.cost) == Decimal("2.00")
+diff --git a/backend/tests/test_billing_service.py b/backend/tests/test_billing_service.py
+--- a/backend/tests/test_billing_service.py
++++ b/backend/tests/test_billing_service.py
+@@ -95,7 +95,7 @@
+         assert row.user_id == "caller"
+         assert row.user_name == "Alice"
+         assert row.project_name == "Film"
+-        assert row.parameters_json == {"resolution": "1080p"}
++        assert row.parameters_json == {"resolution": "1080p", "image_count": 1}
+         assert row.cost is None
+         assert row.cost_status == "pending"
+ 
+diff --git a/backend/tests/test_video_pricing_context.py b/backend/tests/test_video_pricing_context.py
+--- a/backend/tests/test_video_pricing_context.py
++++ b/backend/tests/test_video_pricing_context.py
+@@ -31,6 +31,7 @@
+         return httpx.Response(200, json={
+             "id": "remote-task", "status": "succeeded",
+             "model": "doubao-seedance-2-0-260128", "resolution": "1080p",
++            "duration": 7.5,
+             "usage": {"completion_tokens": 35800, "total_tokens": 35800},
+             "content": {"video_url": "https://example.invalid/output.mp4"},
+         })
+@@ -52,12 +53,15 @@
+     assert status == "Success"
+     assert submitted["parameters_json"] == {
+         "resolution": "720p", "has_video_input": bool(video_inputs), "video_input_count": len(video_inputs),
++        "duration": 5,
+     }
+     assert provider.billing_metadata["parameters_json"] == {
+         "resolution": "1080p", "has_video_input": bool(video_inputs), "video_input_count": len(video_inputs),
++        "duration": 5,
+     }
+     assert provider.billing_metadata["billing_model"] == "doubao-seedance-2-0-260128"
+     assert provider.billing_metadata["usage_json"]["total_tokens"] == 35800
++    assert provider.billing_metadata["usage_json"]["duration_seconds"] == "7.5"
+     assert outgoing[0]["resolution"] == "720p"
+     assert sum(item["type"] == "video_url" for item in outgoing[0]["content"]) == len(video_inputs)
+     assert "private prompt" not in str(provider.billing_metadata)

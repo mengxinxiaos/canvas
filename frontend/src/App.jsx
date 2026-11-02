@@ -3,7 +3,7 @@ import { Loader2 } from 'lucide-react';
 import { authService } from './services/api';
 import LoginScreen from './pages/LoginScreen';
 //import Dashboard from './pages/Dashboard';
-import Dashboard from './pages/Dashboard/dashboard';
+import Dashboard from './pages/Dashboard/Dashboard';
 //import Workspace from './components/canvas/main-canvas/Workspace';
 import TapnowCanvas from './components/canvas/TapnowCanvas';
 

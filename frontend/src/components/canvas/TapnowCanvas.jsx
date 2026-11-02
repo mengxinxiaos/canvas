@@ -22,7 +22,13 @@ import { useCanvasInteraction } from '../../hooks/useCanvasInteraction';
 import { useCanvasHotkeys } from '../../hooks/useCanvasHotkeys';
 import { useNodeOperations } from '../../hooks/useNodeOperations';
 import { useCanvasThumbnail } from '../../hooks/useCanvasThumbnail';
+//agent相关
 
+import {
+    CanvasAgentWidget,
+    useAgentCanvasActionExecutor,
+    useCanvasAgentController,
+} from '../../agent';
 
 export default function TapnowCanvas({ user, projectId, onBack }) {
   
@@ -55,6 +61,10 @@ export default function TapnowCanvas({ user, projectId, onBack }) {
       return { x: (sx - vp.x) / vp.zoom, y: (sy - vp.y) / vp.zoom };
   }, []);
 
+  const shareToken = useMemo(() => {
+      return new URLSearchParams(window.location.search).get('shareToken');
+  }, []);
+
   // ================= 2. 挂载各大业务引擎 =================
   
   // 📦 核心沙箱：为当前画布生成独立的 Yjs 实例
@@ -67,7 +77,7 @@ export default function TapnowCanvas({ user, projectId, onBack }) {
 
   // 💾 数据引擎 (负责项目拉取、防抖保存、数据合并分发)
   const { isFirstLoad, isSaving, dispatchAndSave, updateNodeStrictAndSave, saveToCloud } = useProjectData(
-      projectId, showToast, yjsInstances
+      projectId, showToast, yjsInstances, shareToken
   );
   // 🖱️ 交互引擎 (负责画布拖拽、缩放、框选)
   const { dragState, setDragState, handleCanvasPointerDown } = useCanvasInteraction({
@@ -80,15 +90,41 @@ export default function TapnowCanvas({ user, projectId, onBack }) {
       setDrawingNodeId, setEdgeMenu, setPreviewMedia, setCroppingNodeId, setContextMenu
   });
 
-  // 🛠️ 节点操作引擎 (负责创建节点、AI生成、打组等)
-  const { handleGroupSelection, handleBatchDownload, createNode, handleCreateFromEdge, handleGenerate, nodeActions } = useNodeOperations({
-      projectId, containerRef, canvasWrapperRef,screenToCanvas, dispatchAndSave, updateNodeStrictAndSave, showToast,
-      setSelection, setContextMenu, setEdgeMenu, setPreviewMedia, setVisiblePrompts, drawingNodeId, croppingNodeId,
-      setCroppingNodeId, setDrawingNodeId, setDragState, dragState
-  });
-
   // 📸 缩略图引擎 (负责退出时静默截图并保存)
   const { isGeneratingThumb, generateAndSaveThumbnail } = useCanvasThumbnail(projectId, containerRef);
+
+  //agent相关引擎
+    const { executeAgentAction } = useAgentCanvasActionExecutor({
+        dispatchAndSave,
+        updateNodeStrictAndSave,
+        pushHistory,
+        setSelection,
+        screenToCanvas,
+        showToast,
+
+        nodes,
+        selection,
+    });
+
+  const agentController = useCanvasAgentController({
+      user,
+      projectId,
+      projectName: name,
+      nodes,
+      edges,
+      selection,
+      executeAgentAction,
+      shareToken,
+  });
+
+  // 🛠️ 节点操作引擎 (负责创建节点、AI生成、打组等)
+  const { handleGroupSelection, handleBatchDownload, createNode, handleCreateFromEdge, handleGenerate, nodeActions } = useNodeOperations({
+      projectId, shareToken, containerRef, canvasWrapperRef,screenToCanvas, dispatchAndSave, updateNodeStrictAndSave, showToast,
+      setSelection, setContextMenu, setEdgeMenu, setPreviewMedia, setVisiblePrompts, drawingNodeId, croppingNodeId,
+      setCroppingNodeId, setDrawingNodeId, setDragState, dragState,
+      isPickingCanvasImages: agentController.isPickingCanvasImages,
+      addCanvasImageAttachment: agentController.addCanvasImageAttachment,
+  });
 
   // ================= 3. 画布事件监听与衍生状态 =================
   // 用于绕过 React 渲染的高速本地缓存
@@ -714,6 +750,60 @@ export default function TapnowCanvas({ user, projectId, onBack }) {
       {activeNodes.length === 1 && ['image', 'video'].includes(activeNodes[0].type) && !drawingNodeId && !croppingNodeId && (
         <GenerationPanel key={activeNodes[0].id} mode={activeNodes[0].type} anchorNode={activeNodes[0]} incomingNodes={edges.filter(e => e.to === activeNodes[0].id).map(e => nodes.find(n => n.id === (e.from === activeNodes[0].id ? e.to : e.from))).filter(Boolean)} viewport={viewport} onGenerate={handleGenerate} updateNodeData={updateNodeStrictAndSave} onRemoveConnection={nodeActions.onRemoveConnection}/>
       )}
+      <CanvasAgentWidget
+            title={agentController.activeConversation?.title || 'Canvas Agent'}
+
+            chatState={{
+                messages: agentController.messages,
+                input: agentController.input,
+                isLoading: agentController.isLoading,
+                isAgentBusy: agentController.isAgentBusy,
+                error: agentController.error,
+            }}
+            chatActions={{
+                setInput: agentController.setInput,
+                onSend: agentController.sendMessage,
+                onNewConversation: agentController.newConversation,
+            }}
+
+            conversationState={{
+                conversations: agentController.conversations,
+                activeConversationId: agentController.activeConversationId,
+                isLoadingList: agentController.isLoadingList,
+            }}
+            conversationActions={{
+                onRefreshConversations: agentController.refreshConversations,
+                onOpenConversation: agentController.openConversation,
+                onDeleteConversation: agentController.deleteConversation,
+            }}
+
+            skillState={{
+                availableSkills: agentController.availableSkills,
+                selectedSkillNames: agentController.selectedSkillNames,
+                isLoadingSkills: agentController.isLoadingSkills,
+                skillsError: agentController.skillsError,
+            }}
+            skillActions={{
+                addSkillName: agentController.addSkillName,
+                removeSkillName: agentController.removeSkillName,
+                toggleSkillName: agentController.toggleSkillName,
+                refreshSkills: agentController.refreshSkills,
+            }}
+
+            modelState={{
+                agentModelSelector: agentController.agentModelSelector,
+            }}
+
+            attachmentState={{
+                attachments: agentController.agentAttachments,
+                isPickingCanvasImages: agentController.isPickingCanvasImages,
+            }}
+            attachmentActions={{
+                onRemoveAttachment: agentController.removeAgentAttachment,
+                onStartPickCanvasImages: agentController.startPickCanvasImages,
+                onStopPickCanvasImages: agentController.stopPickCanvasImages,
+            }}
+        />
     </div>
   );
 }

@@ -4,6 +4,7 @@ from app.core.config import settings
 
 class VolcengineClient(BaseVideoClient):
     def __init__(self, is_po_xian):
+        super().__init__(provider="poxian" if is_po_xian else "volcengine")
         api_version = "po_xian" if is_po_xian else "default"
         self.api_key, self.base_url = self.get_api_details(api_version)
 
@@ -21,6 +22,7 @@ class VolcengineClient(BaseVideoClient):
         return api_key, base_url
 
     async def submit_task(self, client: httpx.AsyncClient, prompt: str, model: str, **kwargs):
+        self._reset_billing(model=model)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -88,6 +90,7 @@ class VolcengineClient(BaseVideoClient):
             "duration": int(kwargs.get("duration", 5)),
             "watermark": False
         }
+        self._capture_submission_parameters(payload)
         
         print(f"🚀 [VolcengineClient(HTTP)] 最终发给火山的 payload 核心参数:")
         print(f"   👉 Resolution: {payload['resolution']}")
@@ -98,15 +101,18 @@ class VolcengineClient(BaseVideoClient):
         try:
             response = await client.post(self.base_url, headers=headers, json=payload, timeout=60.0)
             res_data = response.json()
+            self._capture_billing(res_data)
             
             # API 直接调用时，如果报错通常会返回 error 字段
             if "error" in res_data:
-                error_message = res_data.get("error", {}).get("message", str(res_data))
+                error_message = res_data.get("error", {}).get("message", "供应商请求失败")
                 return None, f"Volcengine API 错误: {error_message}"
                 
             if "id" not in res_data:
-                return None, f"Volc Error: 异常返回体 {res_data}"
+                return None, "Volc Error: 未解析到任务 ID，请联系管理员核对调用记录。"
                 
+            self.provider_request_id = str(res_data["id"])
+            self._capture_billing(res_data)
             return res_data["id"], "Success"
         except Exception as e:
             return None, f"HTTP 请求失败: {str(e)}"
@@ -117,9 +123,11 @@ class VolcengineClient(BaseVideoClient):
         try:
             res = await client.get(url, headers=headers, timeout=30.0)
             data = res.json()
+            self._capture_billing(data)
             status = data.get("status")
             
             if status == "succeeded":
+                self.generation_succeeded = True
                 if "content" in data and "video_url" in data["content"]:
                     return "Success", data["content"]["video_url"]
                 return "Failed", "No video_url in content"

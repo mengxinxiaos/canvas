@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import httpx
 from app.core.config import settings
 from app.services.image_generation.base import BaseImageClient
@@ -6,24 +7,25 @@ from app.services.image_generation.utils import _get_resolution_gpt_image
 
 class ZhenZhenClient(BaseImageClient):
     def __init__(self):
-        base = (settings.IMAGE_API_BASE or "https://ai.t8star.cn").rstrip("/")
+        super().__init__(provider="zhenzhen")
+        base = (settings.ZHENZHEN_API_BASE or "https://ai.t8star.cn").rstrip("/")
         if base.endswith("/v1"):
             base = base[:-3].rstrip("/")
         self.base_url = base
         self.api_url = f"{self.base_url}/v1/images/generations"
         self.task_url_prefix = f"{self.base_url}/v1/images/tasks"
-        self.api_key = settings.IMAGE_API_KEY
+        self.api_key = settings.ZHENZHEN_API_KEY
         # 轮询接口不需要长连接等待，用普通短超时即可
         self.timeout = httpx.Timeout(connect=10.0, read=None, write=None, pool=10.0)
 
         if not self.api_key:
-            raise ValueError("IMAGE_API_KEY is not configured for ZhenZhen")
+            raise ValueError("ZHENZHEN_API_KEY is not configured for ZhenZhen")
     
     def _build_api_key(self,model):
         if "gpt" in model.lower():
-            return settings.IMAGE_API_KEY_GPT
+            return settings.ZHENZHEN_API_KEY_GPT
         else:
-            return settings.IMAGE_API_KEY
+            return settings.ZHENZHEN_API_KEY
 
     def _build_headers(self, api_key=None):
         target_key = api_key or self.api_key
@@ -44,6 +46,10 @@ class ZhenZhenClient(BaseImageClient):
         if "gpt" in safe_model:
             payload["quality"] = "high"
             payload["size"] = _get_resolution_gpt_image(image_size, aspect_ratio)
+            print(f"   👉 image_size: {image_size}")
+            print(f"   👉 aspect_ratio: {aspect_ratio}")
+            print(f"   👉 size: {payload['size']}")
+            
         else:
             payload["aspect_ratio"] = aspect_ratio or "1:1"
             if "nano-banana" in safe_model:
@@ -55,6 +61,7 @@ class ZhenZhenClient(BaseImageClient):
         return payload
 
     async def generate(self, client: httpx.AsyncClient, prompt: str, model: str, aspect_ratio: str, image_size: str, image_urls=None, **kwargs):
+        self._reset_billing(model=model)
         try:
             # 1. 创建任务
             actual_api_key = self._build_api_key(model)
@@ -68,11 +75,23 @@ class ZhenZhenClient(BaseImageClient):
                 timeout= self.timeout,
             )
             if res.status_code != 200:
-                return None, {"code": "API_REQUEST_FAILED", "message": f"创建异步任务失败: {res.text}"}
+                return None, {"code": "API_REQUEST_FAILED", "message": f"创建异步任务失败（HTTP {res.status_code}）"}
             
-            task_id = res.json().get("task_id")
+            submitted = res.json()
+            task_id = submitted.get("task_id") or submitted.get("id")
             if not task_id:
                 return None, {"code": "MISSING_TASK_ID", "message": "接口未返回 task_id"}
+
+            self.provider_request_id = str(task_id)
+            self._capture_billing(submitted)
+            on_submitted = kwargs.get("on_submitted")
+            if on_submitted:
+                notified = on_submitted(
+                    provider_request_id=self.provider_request_id,
+                    metadata=dict(self.billing_metadata),
+                )
+                if inspect.isawaitable(notified):
+                    await notified
 
             # 2. 轮询结果
             max_attempts = 180 
@@ -81,18 +100,21 @@ class ZhenZhenClient(BaseImageClient):
                 query_res = await client.get(f"{self.task_url_prefix}/{task_id}", headers = header, timeout=self.timeout)
                 
                 if query_res.status_code != 200:
-                    return None, {"code": "QUERY_FAILED", "message": f"查询失败: {query_res.text}"}
+                    return None, {"code": "QUERY_FAILED", "message": f"查询失败（HTTP {query_res.status_code}）"}
                 
                 result = query_res.json()
+                self._capture_billing(result)
                 outer_data = result.get("data", {})
                 status = str(outer_data.get("status", "")).lower()
 
                 if result.get("code") not in (None, "success"):
-                    return None, {"code": "PLATFORM_EXCEPTION", "message": f"平台响应异常: {result}"}
+                    return None, {"code": "PLATFORM_EXCEPTION", "message": "供应商响应异常，请联系管理员核对调用记录。"}
 
                 if status in ("success",):
+                    self.generation_succeeded = True
                     urls = self._extract_urls(outer_data.get("data"))
                     if urls:
+                        self.billing_metadata.setdefault("usage_json", {})["image_count"] = len(urls)
                         # 成功时，也统一返回约定的格式
                         return urls, {"code": "SUCCESS", "message": "Success"}
                     return None, {"code": "NO_URL_PARSED", "message": "任务成功但未解析到图片URL"}

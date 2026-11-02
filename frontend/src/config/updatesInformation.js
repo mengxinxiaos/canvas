@@ -22,7 +22,7 @@ export const CHANGELOG_DATA = [
     ]
   },
   {
-    version: 'v1.0.4',
+    version: 'v1.0.4.1',
     date: '2026-05-20',
     type: 'feature', // feature | fix | optimize
     title: '新功能',

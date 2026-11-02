@@ -11,7 +11,7 @@ import React, {
 import { usePanelPosition } from './hooks/usePanelPosition';
 import { useGenerationParams } from './hooks/useGenerationParams';
 
-import { buildPresetPrompt } from '../../../utils/promptbuilder';
+import { buildPresetPrompt } from '../../../utils/promptBuilder';
 import { getDimensionsByRatio } from '../../../utils/helpers';
 
 import MentionTextarea from './components/MentionTextarea';
@@ -58,7 +58,29 @@ export default function GenerationPanel({
 
     // 用 ref 实时追踪最新 prompt，避免闭包拿到旧值
     const promptRef = useRef(prompt);
+    
+    useEffect(() => {
+        const nextPrompt = anchorNode.generation?.prompt ?? '';
 
+        if (nextPrompt !== promptRef.current) {
+            setPrompt(nextPrompt);
+            promptRef.current = nextPrompt;
+
+            // 强制 MentionTextarea 同步外部变更后的内容
+            setPromptForceSyncKey((prev) => prev + 1);
+
+            /*
+            console.group('[AgentDebug] GenerationPanel prompt synced');
+            console.log('nodeId:', anchorNode.id);
+            console.log('nextPrompt:', nextPrompt);
+            console.groupEnd();
+            */
+        }
+    }, [
+        anchorNode.id,
+        anchorNode.generation?.prompt,
+    ]);
+    
     useEffect(() => {
         promptRef.current = prompt;
     }, [prompt]);

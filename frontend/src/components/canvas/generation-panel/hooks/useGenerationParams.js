@@ -70,7 +70,40 @@ export function useGenerationParams(
     const config = useMemo(() => {
         return getModelConfig(mode, currentModelId);
     }, [mode, currentModelId]);
+    
+    const persistParamsToNode = useCallback((nextParams, overrides = {}) => {
+        if (!updateNodeData) return;
 
+        const prevGeneration = generationRef.current || {};
+        const currentModel = mode === 'image'
+            ? nextParams.imageModel
+            : nextParams.videoModel;
+
+        const nextGeneration = {
+            ...prevGeneration,
+
+            model: currentModel,
+            aspectRatio: nextParams.aspectRatio,
+            imageSize: nextParams.imageSize,
+            duration: nextParams.duration,
+            resolution: nextParams.resolution,
+            gridMode: nextParams.gridMode,
+            imageStyle: nextParams.imageStyle,
+            videoRefMode: nextParams.videoRefMode,
+
+            ...overrides,
+        };
+
+        updateNodeData(anchorNode.id, {
+            generation: nextGeneration,
+        });
+
+        generationRef.current = nextGeneration;
+    }, [
+        anchorNode.id,
+        mode,
+        updateNodeData
+    ]);
     const updateParam = useCallback((key, value) => {
         setParams(prev => {
             const next = {
@@ -126,10 +159,14 @@ export function useGenerationParams(
                     }
                 }
             }
-
+            // 关键：参数修改后立即写回节点
+            persistParamsToNode(next);
             return next;
         });
-    }, [mode]);
+    }, [
+        mode,
+        persistParamsToNode
+    ]);
 
     useEffect(() => {
         if (mode !== 'video') return;
