@@ -34,6 +34,10 @@ class BaseVideoClient(ABC):
             "has_video_input": video_count > 0,
             "video_input_count": video_count,
         }
+        if payload.get("duration") is not None:
+            # Keep the effective requested seconds for fallback only. Actual
+            # output duration is extracted separately into usage_json.
+            self.billing_parameters["duration"] = payload["duration"]
         self.billing_metadata["parameters_json"] = dict(self.billing_parameters)
 
     def _capture_billing(self, response):

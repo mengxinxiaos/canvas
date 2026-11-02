@@ -95,7 +95,7 @@ def test_begin_snapshots_actual_caller_and_filters_parameters(billing_db):
         assert row.user_id == "caller"
         assert row.user_name == "Alice"
         assert row.project_name == "Film"
-        assert row.parameters_json == {"resolution": "1080p"}
+        assert row.parameters_json == {"resolution": "1080p", "image_count": 1}
         assert row.cost is None
         assert row.cost_status == "pending"
 

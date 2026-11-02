@@ -26,14 +26,24 @@ _USAGE_FIELDS = frozenset({
     "cache_creation_input_tokens", "reasoning_tokens", "image_tokens",
     "text_tokens", "audio_tokens", "image_count", "images", "generated_images",
     "video_count", "duration", "duration_seconds", "video_seconds", "seconds",
+    "video_duration", "output_duration", "output_duration_seconds",
     "input_tokens_details", "output_tokens_details", "prompt_tokens_details",
     "completion_tokens_details", "successful_requests",
 })
 _PARAMETER_FIELDS = frozenset({
     "mode", "aspectRatio", "aspect_ratio", "imageSize", "image_size",
-    "duration", "resolution", "ratio", "max_tokens", "stream", "image_count",
+    "duration", "duration_seconds", "resolution", "ratio", "max_tokens", "stream", "image_count", "n", "num_images",
     "purpose", "attempt",
     "has_video_input", "video_input_count",
+})
+_IMAGE_QUANTITY_FIELDS = ("image_count", "generated_images", "images")
+_DURATION_QUANTITY_FIELDS = (
+    "duration_seconds", "output_duration_seconds", "video_seconds",
+    "video_duration", "output_duration", "duration", "seconds",
+)
+_BILLABLE_USAGE_FIELDS = frozenset({
+    *_IMAGE_QUANTITY_FIELDS, *_DURATION_QUANTITY_FIELDS,
+    "total_tokens", "input_tokens", "output_tokens", "image_tokens",
 })
 
 
@@ -127,6 +137,9 @@ def _safe_usage(node: dict) -> dict:
         if key not in _USAGE_FIELDS:
             continue
         if isinstance(value, dict):
+            if key in _BILLABLE_USAGE_FIELDS:
+                result[key] = None
+                continue
             nested = _safe_usage(value)
             if nested:
                 result[key] = nested
@@ -135,13 +148,79 @@ def _safe_usage(node: dict) -> dict:
             if number is not None:
                 # Preserve exact decimal strings; don't introduce binary float conversion.
                 result[key] = value if isinstance(value, int) else number
+            elif key in _BILLABLE_USAGE_FIELDS:
+                # Present but invalid actual usage must not silently fall back
+                # to the requested count/duration. Keep a bounded sentinel,
+                # never arbitrary supplier text or a hostile decimal exponent.
+                result[key] = None
+        elif key in _BILLABLE_USAGE_FIELDS and not (
+            key in {"images", "generated_images"} and isinstance(value, list)
+        ):
+            result[key] = None
     return result
+
+
+def _image_output_count(node: dict) -> int | None:
+    """Count recognizable image results, without storing URLs or image bytes.
+
+    Only known result-list fields are inspected. Input/reference arrays, chat
+    content, and request echoes nested under ``request`` are never traversed.
+    Provider adapters remain responsible for less conventional response shapes.
+    """
+    for key in ("images", "generated_images", "data"):
+        outputs = node.get(key)
+        if not isinstance(outputs, list):
+            continue
+        if not outputs:
+            if key in {"images", "generated_images"}:
+                return 0
+            continue
+        count = 0
+        uncertain = False
+        for item in outputs:
+            if not isinstance(item, dict) or item.get("error"):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if item_type in {"video", "video_url", "input_image", "reference_image"}:
+                continue
+            if isinstance(item.get("b64_json"), str) and item["b64_json"]:
+                count += 1
+                continue
+            url = item.get("url")
+            if not isinstance(url, str) or not url.strip():
+                continue
+            path = url.split("?", 1)[0].split("#", 1)[0].lower()
+            is_image = path.endswith((".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".bmp"))
+            if key != "data" or item_type in {"image", "image_url", "output_image"} or is_image:
+                if not path.endswith((".mp4", ".mov", ".webm", ".mkv", ".avi")):
+                    count += 1
+            else:
+                uncertain = True
+        if count and not uncertain:
+            return count
+    return None
+
+
+def _canonical_usage(usage: dict, inferred_image_count: int | None = None) -> dict:
+    """Expose actual output quantities under stable billing field names."""
+    for field in _IMAGE_QUANTITY_FIELDS:
+        if field in usage:
+            usage["image_count"] = usage[field]
+            break
+    else:
+        if inferred_image_count is not None:
+            usage["image_count"] = inferred_image_count
+    for field in _DURATION_QUANTITY_FIELDS:
+        if field in usage:
+            usage["duration_seconds"] = usage[field]
+            break
+    return usage
 
 
 def extract_billing(response: Any, provider: str | None = None) -> dict:
     """Normalize explicit cost/usage fields from a raw dict or SDK response.
 
-    No totals are computed from nested items. The outermost valid cost wins.
+    No monetary totals are computed from nested items. The outermost valid cost wins.
     MiniMax and Aliyun are deliberately excluded from cost collection.
     """
     nodes = _response_nodes(response)
@@ -149,6 +228,8 @@ def extract_billing(response: Any, provider: str | None = None) -> dict:
     currency = None
     request_id = None
     usage = {}
+    inferred_image_count = None
+    billing_model = None
     for node, inherited_unit in nodes:
         if request_id is None:
             for key in ("request_id", "requestId", "task_id", "taskId", "id"):
@@ -157,6 +238,10 @@ def extract_billing(response: Any, provider: str | None = None) -> dict:
                     request_id = str(candidate)[:512]
                     break
         usage.update(_safe_usage(node))
+        if inferred_image_count is None:
+            inferred_image_count = _image_output_count(node)
+        if billing_model is None and isinstance(node.get("model"), str):
+            billing_model = node["model"].strip()[:512] or None
         if cost is None:
             raw_cost = node.get("cost")
             candidate = _amount(raw_cost)
@@ -172,9 +257,9 @@ def extract_billing(response: Any, provider: str | None = None) -> dict:
         "cost": None if unsupported else cost,
         "currency": None if unsupported else currency,
         "cost_status": "not_supported" if unsupported else ("reported" if cost is not None else "unavailable"),
-        "usage_json": usage,
+        "usage_json": _canonical_usage(usage, inferred_image_count),
         "provider_request_id": request_id,
-        "billing_model": str(_as_dict(response).get("model") or "")[:512] or None,
+        "billing_model": billing_model,
     }
 
 
@@ -199,6 +284,13 @@ def begin_call(
         project = db.get(Project, project_id) if project_id else None
         call_id = uuid.uuid4().hex
         unsupported = str(provider or "").strip().lower() in UNSUPPORTED_PROVIDERS
+        effective_parameters = _safe_parameters(parameters)
+        if call_type == "image_generation" and not any(
+            field in effective_parameters for field in ("image_count", "n", "num_images")
+        ):
+            # Current image requests are single-image requests. Actual returned
+            # counts always win; this is only the requested-quantity fallback.
+            effective_parameters["image_count"] = 1
         row = APICall(
             id=call_id,
             operation_id=operation_id or uuid.uuid4().hex,
@@ -217,7 +309,7 @@ def begin_call(
             currency=None,
             cost_status="not_supported" if unsupported else "pending",
             usage_json={},
-            parameters_json=_safe_parameters(parameters),
+            parameters_json=effective_parameters,
             started_at=_now(),
         )
         _refresh_pricing(row)
@@ -235,7 +327,7 @@ def _merge_metadata(row: APICall, metadata: dict | None) -> None:
     metadata = metadata or {}
     if isinstance(metadata.get("usage_json"), dict):
         usage = dict(row.usage_json or {})
-        usage.update(_safe_usage(metadata["usage_json"]))
+        usage.update(_canonical_usage(_safe_usage(metadata["usage_json"])))
         row.usage_json = usage
     request_id = metadata.get("provider_request_id")
     if request_id is not None:
@@ -286,6 +378,17 @@ def _refresh_pricing(row: APICall) -> None:
         row.cost = None
         row.currency = None
         row.cost_status = "not_supported" if result["cost_status"] == "not_supported" else "pending"
+    elif row.status != "success" and (
+        row.pricing_snapshot.get("billing_mode") == "local"
+        or row.pricing_snapshot.get("kind") in {"unit_rate", "token_rate"}
+    ):
+        # A requested quantity does not establish that a failed or interrupted
+        # generation incurred the configured local price. Preserve raw supplier
+        # evidence, but settle local rules only for successful generations.
+        row.cost = None
+        row.currency = None
+        row.cost_status = "unavailable"
+        row.pricing_snapshot = {**row.pricing_snapshot, "reason": "call_not_successful"}
     else:
         row.cost = result["cost"]
         row.currency = result["currency"]

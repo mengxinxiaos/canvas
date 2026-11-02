@@ -31,6 +31,7 @@ def test_provider_captures_effective_payload_and_actual_response_model(monkeypat
         return httpx.Response(200, json={
             "id": "remote-task", "status": "succeeded",
             "model": "doubao-seedance-2-0-260128", "resolution": "1080p",
+            "duration": 7.5,
             "usage": {"completion_tokens": 35800, "total_tokens": 35800},
             "content": {"video_url": "https://example.invalid/output.mp4"},
         })
@@ -52,12 +53,15 @@ def test_provider_captures_effective_payload_and_actual_response_model(monkeypat
     assert status == "Success"
     assert submitted["parameters_json"] == {
         "resolution": "720p", "has_video_input": bool(video_inputs), "video_input_count": len(video_inputs),
+        "duration": 5,
     }
     assert provider.billing_metadata["parameters_json"] == {
         "resolution": "1080p", "has_video_input": bool(video_inputs), "video_input_count": len(video_inputs),
+        "duration": 5,
     }
     assert provider.billing_metadata["billing_model"] == "doubao-seedance-2-0-260128"
     assert provider.billing_metadata["usage_json"]["total_tokens"] == 35800
+    assert provider.billing_metadata["usage_json"]["duration_seconds"] == "7.5"
     assert outgoing[0]["resolution"] == "720p"
     assert sum(item["type"] == "video_url" for item in outgoing[0]["content"]) == len(video_inputs)
     assert "private prompt" not in str(provider.billing_metadata)

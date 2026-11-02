@@ -9,13 +9,27 @@ const EMPTY_FILTERS = {
 const PAGE_SIZE = 20;
 const CALL_TYPES = { image_generation: '图片生成', video_generation: '视频生成', agent_chat: 'Agent 对话', history_summary: '历史总结' };
 const STATUSES = { started: '进行中', success: '成功', failed: '失败', interrupted: '已中断' };
-const COST_STATUSES = { pending: '待获取', calculated: '已换算', reported: '供应商金额', unavailable: '待计价', not_supported: '暂不采集' };
+const COST_STATUSES = { pending: '待获取', calculated: '已计价', reported: '供应商金额', unavailable: '待计价', not_supported: '暂不采集' };
 const PRICING_REASONS = {
     legacy_without_pricing_rule: '旧记录未保存当时的计价规则，原始数据已保留，暂不纳入换算合计。',
     missing_provider_cost: '供应商尚未返回原始费用。',
     invalid_provider_cost: '供应商费用格式无效，暂不换算。',
     missing_total_tokens: '供应商尚未返回实际 total_tokens。',
     invalid_total_tokens: '供应商 total_tokens 格式无效，暂不计价。',
+    missing_image_count: '供应商与请求参数均未提供可用的生成张数。',
+    invalid_image_count: '生成张数格式无效，暂不计价。',
+    missing_duration: '供应商与请求参数均未提供可用的视频时长。',
+    invalid_duration: '视频时长格式无效，暂不计价。',
+    missing_duration_seconds: '供应商与请求参数均未提供可用的视频时长。',
+    invalid_duration_seconds: '视频时长格式无效，暂不计价。',
+    missing_token_usage: '供应商尚未返回本规则所需的实际 Token 用量。',
+    invalid_token_usage: '供应商返回的 Token 用量格式无效，暂不计价。',
+    missing_token_quantity: '供应商尚未返回本规则所需的实际 Token 用量。',
+    invalid_token_quantity: '供应商返回的 Token 用量格式无效，暂不计价。',
+    missing_price_variant: '当前生成条件没有匹配的单价，请管理员补充配置。',
+    no_matching_price_variant: '当前生成条件没有匹配的单价，请管理员补充配置。',
+    ambiguous_price_variant: '当前生成条件匹配到多个单价，请管理员核对配置。',
+    call_not_successful: '调用尚未成功，不按配置单价计算费用。',
     missing_resolution: '缺少生成分辨率，暂不能匹配单价。',
     unsupported_resolution: '当前分辨率尚未配置计价规则。',
     missing_video_input_presence: '尚未确认实际请求是否包含视频输入。',
@@ -55,6 +69,24 @@ function pricingExplanation(record) {
             return `${condition}；${decimalText(rule.total_tokens)} ÷ ${decimalText(rule.token_unit || '1000000')} × ${decimalText(rule.rate_per_million_tokens)} = ${result}`;
         }
         return `${condition}；等待供应商返回实际 total_tokens。`;
+    }
+    if (rule.kind === 'unit_rate') {
+        const unit = { image: '张', second: '秒', token: 'Token' }[rule.unit] || rule.unit || '单位';
+        const quantityName = { image: '生成张数', second: '视频时长', token: 'Token 用量' }[rule.unit] || '用量';
+        const basis = rule.quantity_source === 'request_parameters'
+            ? `供应商未返回实际${quantityName}，采用请求参数`
+            : rule.quantity_source === 'provider_response' ? `采用供应商返回的实际${quantityName}` : '等待可用用量';
+        const selectors = { ...(rule.resolution ? { resolution: rule.resolution } : {}), ...(rule.image_size ? { image_size: rule.image_size } : {}), ...(typeof rule.has_video_input === 'boolean' ? { has_video_input: rule.has_video_input } : {}), ...rule.price_conditions };
+        const selectorLabels = { resolution: '分辨率', image_size: '图片尺寸', imageSize: '图片尺寸', aspect_ratio: '宽高比', aspectRatio: '宽高比', mode: '生成模式' };
+        const condition = Object.entries(selectors).map(([key, value]) => key === 'has_video_input' && typeof value === 'boolean'
+            ? value ? '含视频输入' : '不含视频输入'
+            : `${selectorLabels[key] || key}：${typeof value === 'boolean' ? value ? '是' : '否' : value}`).join(' · ');
+        const prefix = `${condition ? `${condition}；` : ''}${basis}`;
+        if (rule.unit_price == null) return `${prefix}；等待匹配单价。`;
+        const unitSize = rule.unit_size ?? '1';
+        const price = `${decimalText(rule.unit_price)} ${rule.currency || rule.rule?.currency || record.currency || '（币种未标注）'} / ${decimalText(unitSize)} ${unit}`;
+        if (rule.quantity == null) return `${prefix}；单价 ${price}。`;
+        return `${prefix}；单价 ${price}；${decimalText(rule.quantity)} ${unit} ÷ ${decimalText(unitSize)} × ${decimalText(rule.unit_price)} = ${result}`;
     }
     if (rule.kind === 'provider_reported') return '使用供应商返回的原始金额及单位，未作人民币换算。';
     return null;
@@ -120,7 +152,7 @@ function RecordDetails({ record }) {
                 </dl>
                 {explanation && <p className="mt-3 break-all leading-relaxed text-neutral-300">{explanation}</p>}
                 {rule?.reason && <p className="mt-3 leading-relaxed text-amber-200/80">{PRICING_REASONS[rule.reason] || '计价信息不足，请结合规则快照核对。'}</p>}
-                {record.cost_status === 'calculated' && <p className="mt-2 leading-relaxed text-neutral-500">根据本次保存的规则换算，便于成本统计；金额仍需与供应商账单核对。</p>}
+                {record.cost_status === 'calculated' && <p className="mt-2 leading-relaxed text-neutral-500">根据本次保存的规则计算费用；用量来源和计算过程见上方说明。</p>}
             </div>
             <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 xl:grid-cols-3">
                 {details.map(([label, value]) => (
@@ -306,7 +338,7 @@ function UsageDashboard({ onClose }) {
                                 </div>
                                 <div className="flex items-center justify-between border-t border-white/10 px-4 py-3 text-xs text-neutral-500"><span>每页 {PAGE_SIZE} 条 · 第 {page} / {totalPages} 页</span><div className="flex gap-2"><button type="button" onClick={() => changePage(page - 1)} disabled={page <= 1} aria-label="上一页" className="rounded-lg border border-white/10 p-2 hover:text-white disabled:opacity-30"><ChevronLeft size={15} /></button><button type="button" onClick={() => changePage(page + 1)} disabled={page >= totalPages} aria-label="下一页" className="rounded-lg border border-white/10 p-2 hover:text-white disabled:opacity-30"><ChevronRight size={15} /></button></div></div>
                             </section>
-                            <p className="text-xs leading-relaxed text-neutral-600">zhenzhen 按原始费用与配置系数换算；火山与 poxian 的 Seedance 2.0 按实际 Token、分辨率及视频输入规则计价。没有匹配规则或必要用量时保留空值；MiniMax 与阿里云暂不计价。规则换算结果用于成本统计，仍需与供应商账单核对。</p>
+                            <p className="text-xs leading-relaxed text-neutral-600">按供应商与模型配置计价规则，支持按张、按秒、按 Token 或读取供应商费用。按张、按秒优先使用实际结果，缺失时采用请求参数；Token 使用实际用量。没有匹配规则或必要用量时保留空值。</p>
                         </>
                     )}
                 </div>

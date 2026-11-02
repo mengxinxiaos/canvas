@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "version": "2026-10-27.v1",
+  "version": "2026-11-02.v2",
   "source": "user_config",
   "rules": [
     {
@@ -25,6 +25,93 @@
         "without_video": {"480p": "46", "720p": "46", "1080p": "51", "4k": "26"},
         "with_video": {"480p": "28", "720p": "28", "1080p": "31", "4k": "16"}
       }
+    },
+    {
+      "id": "example-image-per-image",
+      "enabled": false,
+      "_note": "模板未启用。请填写真实供应商、模型及已确认单价后，再改为 enabled: true。",
+      "kind": "unit_rate",
+      "providers": ["YOUR_PROVIDER"],
+      "call_types": ["image_generation"],
+      "models": ["YOUR_IMAGE_MODEL"],
+      "unit": "image",
+      "unit_price": "填写确认后的单价",
+      "unit_size": "1",
+      "currency": "CNY"
+    },
+    {
+      "id": "zhenzhen-seedance-2.0-price",
+      "enabled": true,
+      "kind": "unit_rate",
+      "providers": ["zhenzhen"],
+      "call_types": ["video_generation"],
+      "models": ["doubao-seedance-2-0-260128"],
+      "unit": "second",
+      "unit_price": "1.35",
+      "unit_size": "1",
+      "currency": "CNY"
+    },
+    {
+      "id": "zhenzhen-seedance-2.5-price",
+      "enabled": true,
+      "kind": "unit_rate",
+      "providers": ["zhenzhen"],
+      "call_types": ["video_generation"],
+      "models": ["doubao-seedance-2.5"],
+      "unit": "second",
+      "unit_price": "1.35",
+      "unit_size": "1",
+      "currency": "CNY"
+    },
+
+    {
+      "id": "example-image-per-token",
+      "enabled": false,
+      "kind": "unit_rate",
+      "providers": ["YOUR_PROVIDER"],
+      "call_types": ["image_generation"],
+      "models": ["YOUR_IMAGE_MODEL"],
+      "unit": "token",
+      "usage_field": "total_tokens",
+      "unit_price": "填写确认后的每百万 Token 单价",
+      "unit_size": "1000000",
+      "currency": "CNY"
+    },
+    {
+      "id": "zhenzhen-seedance-2.5-price",
+      "enabled": false,
+      "kind": "unit_rate",
+      "providers": ["zhenzhen"],
+      "call_types": ["video_generation"],
+      "models": ["doubao-seedance-2.5"],
+      "unit": "token",
+      "usage_field": "total_tokens",
+      "unit_size": "1000000",
+      "currency": "CNY",
+      "price_variants": [
+        {
+          "when": {
+            "has_video_input": false
+          },
+          "unit_price": "56.7"
+        },
+        {
+          "when": {
+            "has_video_input": true
+          },
+          "unit_price": "94.5"
+        }
+      ]
+    },
+    {
+      "id": "example-model-provider-response",
+      "enabled": false,
+      "kind": "provider_multiplier",
+      "providers": ["YOUR_PROVIDER"],
+      "call_types": ["image_generation", "video_generation"],
+      "models": ["YOUR_MODEL"],
+      "multiplier": "填写确认后的换算系数",
+      "currency": "CNY"
     }
   ]
 }
