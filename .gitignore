@@ -52,6 +52,8 @@ pip-wheel-metadata/
 .ruff_cache/
 .coverage
 htmlcov/
+test-results/
+playwright-report/
 
 # 数据库文件 (不要忽略 alembic 文件夹本身)
 instance/

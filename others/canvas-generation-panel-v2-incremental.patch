@@ -1,0 +1,585 @@
+diff --git a/docs/generation-panel-review.md b/docs/generation-panel-review.md
+index 108f57c..32d7e6e 100644
+--- a/docs/generation-panel-review.md
++++ b/docs/generation-panel-review.md
+@@ -9,7 +9,8 @@
+ - Seedance 2.5 显示合计计数与 50 项上限，超过上限可继续查看和移除，但不能提交。视频卡片不批量请求视频，悬停时仅加载一个预览。
+ - 同类型拖拽排序；成功放置才保存，取消拖拽不改变顺序。支持 Alt＋方向键排序。
+ - 时长使用配置驱动的滑条，“自动”独立选择。当前 2.5 的手动范围为 4–30 秒；切换其他模型时按该模型允许值校正。滑条也能处理非连续时长列表。
+-- 面板测量实际高度，在节点上下与视口边缘间定位；窄屏缩小宽度。参数浮层通过 Portal 显示，避开边缘并支持内部滚动。
++- 普通面板始终位于生成节点下方 16px，不自动翻到节点上方；窄屏缩小宽度，内容内部滚动。右上角提供全屏与退出全屏；全屏使用整个应用视口，桌面分栏、窄屏上下布局。参数浮层继续避开视口边缘。
++- 全屏复用同一面板和编辑器，不重新挂载。提示词、引用顺序、参数与编辑器历史保留；Esc 优先关闭参数浮层，再退出全屏。退出后回到节点下方；背景键盘操作与页面滚动会恢复。
+ 
+ ## 发现并修复的隐藏问题
+ 
+@@ -34,6 +35,7 @@
+ ## 代码边界
+ 
+ - `src/utils/referenceMedia.js`：媒体类型、编号、顺序、序列化、提示词映射与引用校验的纯函数。
++- `PanelFrame.jsx`：只负责定位、全屏展示、焦点与背景交互隔离；常规/全屏始终使用同一个 Portal 容器，避免切换重挂载。
+ - `GenerationPanel.jsx`：协调 prompt、引用和参数，用 patch 保存，不复制整份历史 generation。
+ - `useGenerationParams`：模型配置约束与参数状态；外部参数变化与 prompt/引用写入分开处理。
+ - `PictureTags`：分区展示和拖拽预览；不负责保存提示词或网络提交。
+@@ -43,8 +45,8 @@
+ ## 验证
+ 
+ - `npm ci --ignore-scripts --no-audit --no-fund`：通过。
+-- `npm test`：32 项通过，覆盖编号/删除/重连、50 项、参数归一化、事务映射、请求输入副本、重复提交锁与浮层定位。
+-- `npm run test:browser`：11 项 Chromium 浏览器测试通过，覆盖 50 个混合资产、360px 窄窗口、30s/自动、模型切换、打开与关闭期间断线、键盘排序/撤销、实际拖放/取消、外部文本与顺序同时修改、最新输入提交、加载态阻止 Enter、超限与未就绪引用、外部参数更新及占位显示；同时检查页面运行时异常。
++- `npm test`：33 项通过，覆盖编号/删除/重连、50 项、参数归一化、事务映射、请求输入副本、重复提交锁与浮层定位。
++- `npm run test:browser`：15 项 Chromium 浏览器测试通过，覆盖 50 个混合资产、360px 窄窗口、30s/自动、模型切换、打开与关闭期间断线、键盘排序/撤销、实际拖放/取消、外部文本与顺序同时修改、最新输入提交、加载态阻止 Enter、超限与未就绪引用、外部参数更新及占位显示；新增节点下方锚定与画布偏移、全屏保留同一编辑器与草稿、Esc 顺序/焦点恢复、移动端全屏与窗口缩放检查；同时检查页面运行时异常。
+ - 修改文件的 ESLint 与 `git diff --check`：通过。
+ - `npm run build`：通过。现有主包体积警告仍存在，本轮未扩展到全站分包。
+ - `python -m pytest backend/tests/test_zhenzhen_reference_limits.py backend/tests/test_video_pricing_context.py -q`：22 项通过。
+diff --git a/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx b/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
+index f76569b..8c42e24 100644
+--- a/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
++++ b/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
+@@ -1,5 +1,4 @@
+ import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
+-import { usePanelPosition } from './hooks/usePanelPosition';
+ import { useGenerationParams } from './hooks/useGenerationParams';
+ import { buildPresetPrompt } from '../../../utils/promptBuilder';
+ import { getDimensionsByRatio } from '../../../utils/helpers';
+@@ -10,14 +9,13 @@ import {
+ import MentionTextarea from './components/MentionTextarea';
+ import ControlToolbar from './components/ControlToolbar';
+ import PictureTags from './components/PictureTags';
++import PanelFrame from './components/PanelFrame';
+ import { VIDEO_REFERENCE_MODES, getAvailableModelsByMode } from '../../../config/constants';
+ 
+ export default function GenerationPanel({
+     mode, anchorNode, incomingNodes, viewport, onGenerate, updateNodeData, onRemoveConnection,
+ }) {
+-    const panelRef = useRef(null);
+     const mentionTextareaRef = useRef(null);
+-    const panelStyle = usePanelPosition(anchorNode, viewport, panelRef);
+     const [prompt, setPrompt] = useState(anchorNode.generation?.prompt ?? '');
+     const promptRef = useRef(prompt);
+     const observedPromptRef = useRef(anchorNode.generation?.prompt ?? '');
+@@ -129,17 +127,13 @@ export default function GenerationPanel({
+         onGenerate({ ...generation, nodeId: anchorNode.id, prompt: finalPrompt });
+     }, [anchorNode._isLoading, anchorNode.id, validationError, mode, getParams, persistGeneration, onGenerate]);
+ 
+-    const stopInteraction = event => event.stopPropagation();
+     return (
+-        <div
+-            ref={panelRef}
+-            data-panel-for={anchorNode.id}
+-            aria-label="生成面板"
+-            className="no-wheel no-drag absolute top-0 left-0 bg-[#212121] rounded-3xl shadow-[0_24px_60px_-15px_rgba(0,0,0,0.9)] border border-white/10 flex flex-col z-[100] p-4 pointer-events-auto overflow-y-auto overscroll-contain"
+-            style={panelStyle}
+-            onPointerDown={stopInteraction}
+-            onWheel={stopInteraction}
+-        >
++        <PanelFrame anchorNode={anchorNode} viewport={viewport} mode={mode} onPresentationChange={() => setActivePopover(null)}>
++            {expanded => <>
++            <div className={expanded
++                ? 'flex-1 min-h-0 grid grid-cols-1 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] lg:grid-cols-2 lg:grid-rows-1 gap-5'
++                : 'min-h-0 overflow-y-auto overscroll-contain'}>
++            <div className={expanded ? 'min-h-0 flex flex-col rounded-2xl border border-white/10 bg-black/10 p-4' : ''}>
+             {mode === 'video' && (
+                 <div className="flex shrink-0 items-center gap-2 mb-4 overflow-x-auto">
+                     {VIDEO_REFERENCE_MODES.map(referenceMode => {
+@@ -161,15 +155,19 @@ export default function GenerationPanel({
+                     })}
+                 </div>
+             )}
++            <p className={expanded && !inputMedia.length ? 'text-sm text-neutral-500' : 'hidden'}>连接图片、视频或音频后，将在这里显示参考资产。</p>
+             <PictureTags
+                 pictures={inputMedia}
+                 mode={mode}
+                 videoRefMode={params.videoRefMode}
+                 maxAssets={config.maxReferenceAssets}
++                expanded={expanded}
+                 onReorder={syncReferences}
+                 onDelete={handleDeleteMedia}
+                 onInsert={media => mentionTextareaRef.current?.insertMention?.(media)}
+             />
++            </div>
++            <div className={expanded ? 'min-h-0 flex flex-col rounded-2xl border border-white/10 bg-black/10 p-4' : ''}>
+             <MentionTextarea
+                 ref={mentionTextareaRef}
+                 prompt={prompt}
+@@ -178,9 +176,12 @@ export default function GenerationPanel({
+                 inputMedia={inputMedia}
+                 onSend={handleSend}
+                 forceSyncKey={promptForceSyncKey}
++                expanded={expanded}
+             />
+             {validationError && <p role="alert" className="text-xs text-amber-400 mb-3">{validationError}</p>}
+-            <div className="relative shrink-0">
++            </div>
++            </div>
++            <div className="relative shrink-0 pt-3">
+                 <ControlToolbar
+                     mode={mode}
+                     params={params}
+@@ -194,6 +195,7 @@ export default function GenerationPanel({
+                     isSendBlocked={Boolean(validationError)}
+                 />
+             </div>
+-        </div>
++            </>}
++        </PanelFrame>
+     );
+ }
+diff --git a/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx b/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx
+index 2a421cb..b114e21 100644
+--- a/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx
++++ b/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx
+@@ -260,6 +260,7 @@ const MentionTextarea = forwardRef(({
+     inputPictures,
+     inputMedia,
+     onSend,
++    expanded = false,
+ 
+     // 新增：父级拖拽排序后，递增这个 key，强制 TipTap 同步内容
+     forceSyncKey = 0,
+@@ -500,23 +501,28 @@ const MentionTextarea = forwardRef(({
+     if (!editor) return null;
+ 
+     return (
+-        <div className="px-1 mb-4 relative w-full min-h-0 border-none">
+-            {isEditorEmpty && (
+-                <div className="absolute top-0 left-1 pointer-events-none text-neutral-500 text-[15px] leading-relaxed">
+-                    {mode === 'image'
+-                        ? '描述你想生成的画面 (输入 @ 引用资产)...'
+-                        : '描述你想生成的视频内容 (输入 @ 引用资产)...'}
+-                </div>
+-            )}
+-
+-            <EditorContent
+-                editor={editor}
+-                className="no-wheel [&>.ProseMirror]:min-h-[48px] [&>.ProseMirror]:max-h-[min(180px,25dvh)] [&>.ProseMirror]:overflow-y-auto [&>.ProseMirror]:outline-none [&>.ProseMirror]:p-0"
+-            />
++        <div className={`px-1 relative w-full min-h-0 border-none ${expanded ? 'flex h-full flex-col' : 'mb-4'}`}>
++            <div className={expanded ? 'shrink-0 mb-3 text-xs text-neutral-400' : 'hidden'}>提示词</div>
++            <div className={`relative min-h-0 ${expanded ? 'flex-1' : ''}`}>
++                {isEditorEmpty && (
++                    <div className="absolute top-0 left-0 pointer-events-none text-neutral-500 text-[15px] leading-relaxed">
++                        {mode === 'image'
++                            ? '描述你想生成的画面 (输入 @ 引用资产)...'
++                            : '描述你想生成的视频内容 (输入 @ 引用资产)...'}
++                    </div>
++                )}
++
++                <EditorContent
++                    editor={editor}
++                    className={`no-wheel [&>.ProseMirror]:overflow-y-auto [&>.ProseMirror]:outline-none [&>.ProseMirror]:p-0 ${expanded
++                        ? 'h-full min-h-0 [&>.ProseMirror]:h-full [&>.ProseMirror]:min-h-0 [&>.ProseMirror]:max-h-none'
++                        : '[&>.ProseMirror]:min-h-[48px] [&>.ProseMirror]:max-h-[min(180px,25dvh)]'}`}
++                />
++            </div>
+         </div>
+     );
+ });
+ 
+ MentionTextarea.displayName = 'MentionTextarea';
+ 
+-export default MentionTextarea;
+\ No newline at end of file
++export default MentionTextarea;
+diff --git a/frontend/src/components/canvas/generation-panel/components/PanelFrame.jsx b/frontend/src/components/canvas/generation-panel/components/PanelFrame.jsx
+new file mode 100644
+index 0000000..0bd17e0
+--- /dev/null
++++ b/frontend/src/components/canvas/generation-panel/components/PanelFrame.jsx
+@@ -0,0 +1,96 @@
++import { useEffect, useRef, useState } from 'react';
++import { createPortal } from 'react-dom';
++import { Maximize2, Minimize2 } from 'lucide-react';
++import { usePanelPosition } from '../hooks/usePanelPosition';
++
++const FOCUSABLE = 'button:not(:disabled), [href], input:not(:disabled), select, textarea, [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
++
++export default function PanelFrame({ anchorNode, viewport, mode, onPresentationChange, children }) {
++    const [expanded, setExpanded] = useState(false);
++    const panelRef = useRef(null);
++    const originRef = useRef(null);
++    const toggleRef = useRef(null);
++    const anchoredStyle = usePanelPosition(anchorNode, viewport, panelRef, expanded, originRef);
++
++    useEffect(() => {
++        if (!expanded) return;
++        const panel = panelRef.current;
++        const toggle = toggleRef.current;
++        let background = originRef.current;
++        while (background?.parentElement && background.parentElement !== document.body) {
++            background = background.parentElement;
++        }
++        const previousInert = background?.inert;
++        const previousOverflow = document.body.style.overflow;
++        if (background) background.inert = true;
++        document.body.style.overflow = 'hidden';
++        toggle?.focus({ preventScroll: true });
++
++        const handleKeyDown = event => {
++            if (event.isComposing || event.defaultPrevented) return;
++            // Parameter and mention popups own the first Escape press.
++            if (document.querySelector('[data-popover-placement], .tippy-box[data-state="visible"]')) return;
++            if (event.key === 'Escape') {
++                event.preventDefault();
++                event.stopPropagation();
++                setExpanded(false);
++            } else if (event.key === 'Tab') {
++                const focusable = [...panel.querySelectorAll(FOCUSABLE)].filter(element => element.getClientRects().length);
++                const first = focusable[0];
++                const last = focusable[focusable.length - 1];
++                if ((event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) {
++                    event.preventDefault();
++                    (event.shiftKey ? last : first)?.focus();
++                }
++            }
++        };
++        document.addEventListener('keydown', handleKeyDown, true);
++        return () => {
++            document.removeEventListener('keydown', handleKeyDown, true);
++            if (background) background.inert = previousInert;
++            document.body.style.overflow = previousOverflow;
++            toggle?.focus({ preventScroll: true });
++        };
++    }, [expanded]);
++
++    const stopInteraction = event => event.stopPropagation();
++    return (
++        <>
++            <span ref={originRef} aria-hidden="true" className="absolute top-0 left-0 h-0 w-0 pointer-events-none" />
++            {createPortal(
++                <div
++                    ref={panelRef}
++                    data-panel-for={anchorNode.id}
++                    data-panel-expanded={expanded}
++                    role={expanded ? 'dialog' : 'region'}
++                    aria-modal={expanded || undefined}
++                    aria-label="生成面板"
++                    className={`no-wheel no-drag fixed bg-[#212121] shadow-[0_24px_60px_-15px_rgba(0,0,0,0.9)] border border-white/10 flex flex-col z-[100] p-4 pointer-events-auto overflow-hidden ${expanded ? 'inset-0 rounded-none' : 'top-0 left-0 rounded-3xl'}`}
++                    style={expanded ? { width: '100%', height: '100dvh', maxHeight: '100dvh' } : anchoredStyle}
++                    onPointerDown={stopInteraction}
++                    onWheel={stopInteraction}
++                    onKeyDown={expanded ? stopInteraction : undefined}
++                    onPaste={expanded ? stopInteraction : undefined}
++                >
++                    <div className="shrink-0 flex items-center justify-between gap-3 pb-3">
++                        <span className="text-xs font-medium text-neutral-400">{mode === 'image' ? '图片生成' : '视频生成'}</span>
++                        <button
++                            ref={toggleRef}
++                            type="button"
++                            aria-label={expanded ? '退出全屏' : '全屏编辑'}
++                            aria-expanded={expanded}
++                            title={expanded ? '退出全屏（Esc）' : '全屏编辑'}
++                            onClick={() => { onPresentationChange?.(); setExpanded(value => !value); }}
++                            className="flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs text-neutral-400 hover:text-white hover:bg-white/5 focus-visible:ring-2 focus-visible:ring-blue-500 outline-none"
++                        >
++                            {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
++                            {expanded ? '退出全屏' : '全屏'}
++                        </button>
++                    </div>
++                    {children(expanded)}
++                </div>,
++                document.body,
++            )}
++        </>
++    );
++}
+diff --git a/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx b/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx
+index 6d71a88..6ae670f 100644
+--- a/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx
++++ b/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx
+@@ -18,6 +18,7 @@ export default function PictureTags({
+     onReorder,
+     onDelete,
+     onInsert,
++    expanded = false,
+ }) {
+     // A draft belongs to one exact source snapshot. Incoming asset changes invalidate it,
+     // so a late drop cannot reintroduce a disconnected or externally reordered asset.
+@@ -28,7 +29,7 @@ export default function PictureTags({
+     const currentDrag = drag?.source === sourceSignature ? drag : null;
+     const visiblePictures = currentDrag?.items || pictures;
+     const labeled = useMemo(() => labelReferenceMedia(visiblePictures), [visiblePictures]);
+-    const hoveredAsset = hover?.source === sourceSignature ? hover.media : null;
++    const hoveredAsset = hover?.source === sourceSignature && hover.expanded === expanded ? hover.media : null;
+     const overLimit = maxAssets != null && labeled.length > maxAssets;
+ 
+     const clearDrag = () => {
+@@ -71,20 +72,20 @@ export default function PictureTags({
+ 
+     const showPreview = (media, x, y) => {
+         if (dragRef.current?.source === sourceSignature) return;
+-        setHover({ source: sourceSignature, media, x, y });
++        setHover({ source: sourceSignature, media, x, y, expanded });
+     };
+ 
+     if (labeled.length === 0) return null;
+ 
+     return (
+-        <div className="shrink-0 mb-3 border-b border-white/5 pb-3 min-h-0">
+-            <div className="flex items-center justify-between gap-2 px-1 mb-2 text-xs">
++        <div className={expanded ? 'flex h-full min-h-0 flex-col' : 'shrink-0 mb-3 border-b border-white/5 pb-3 min-h-0'}>
++            <div className="flex shrink-0 items-center justify-between gap-2 px-1 mb-2 text-xs">
+                 <span className="flex items-center gap-1.5 text-neutral-400"><LinkIcon size={13} />参考资产</span>
+                 <span className={overLimit ? 'text-amber-400 tabular-nums' : 'text-neutral-500 tabular-nums'}>
+                     {labeled.length}{maxAssets != null ? ` / ${maxAssets}` : ''} 项{overLimit ? ' · 已超出模型上限' : ''}
+                 </span>
+             </div>
+-            <div className="max-h-[min(300px,40dvh)] overflow-y-auto overscroll-contain px-1 pt-1 pb-2 space-y-3 [scrollbar-width:thin]"
++            <div className={`${expanded ? 'flex-1 min-h-0' : 'max-h-[min(300px,40dvh)]'} overflow-y-auto overscroll-contain px-1 pt-1 pb-2 space-y-3 [scrollbar-width:thin]`}
+                 aria-label="按类型分组的参考资产" onScroll={() => setHover(null)}>
+                 {GROUPS.map(groupDefinition => {
+                     const { type, title, Icon } = groupDefinition;
+@@ -95,7 +96,7 @@ export default function PictureTags({
+                                 <Icon size={12} /><span>{title}</span><span className="text-neutral-600 tabular-nums">{group.length}</span>
+                             </div>
+                             {group.length === 0 ? <p className="text-[11px] text-neutral-600 py-1">未连接{title}</p> : (
+-                                <div className="grid grid-cols-[repeat(auto-fill,minmax(48px,1fr))] gap-2">
++                                <div className={`grid gap-2 ${expanded ? 'grid-cols-[repeat(auto-fill,minmax(72px,1fr))]' : 'grid-cols-[repeat(auto-fill,minmax(48px,1fr))]'}`}>
+                                     {group.map((media, index) => {
+                                         const firstLast = mode === 'video' && videoRefMode === 'first_last' && type === 'image';
+                                         const frameRole = firstLast ? (index === 0 ? '首' : index === group.length - 1 ? '尾' : '参') : null;
+diff --git a/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js b/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js
+index 043c701..428f6e5 100644
+--- a/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js
++++ b/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js
+@@ -1,7 +1,7 @@
+ import { useState, useLayoutEffect } from 'react';
+ import { getPanelLayout } from '../utils/panelLayout.js';
+ 
+-export function usePanelPosition(anchorNode, viewport, panelRef) {
++export function usePanelPosition(anchorNode, viewport, panelRef, expanded, originRef) {
+     const [style, setStyle] = useState({ opacity: 0, width: 520 });
+     const { x, y } = anchorNode.position;
+     const { w, h } = anchorNode.size;
+@@ -9,9 +9,10 @@ export function usePanelPosition(anchorNode, viewport, panelRef) {
+ 
+     useLayoutEffect(() => {
+         const panel = panelRef.current;
+-        if (!panel) return;
++        const origin = originRef.current;
++        if (!panel || !origin || expanded) return;
+         const reposition = () => {
+-            const parentRect = panel.offsetParent?.getBoundingClientRect() ?? { left: 0, top: 0 };
++            const parentRect = origin.getBoundingClientRect();
+             const layout = getPanelLayout({
+                 anchor: {
+                     left: x * zoom + panX + parentRect.left,
+@@ -21,12 +22,11 @@ export function usePanelPosition(anchorNode, viewport, panelRef) {
+                 },
+                 viewportWidth: window.innerWidth,
+                 viewportHeight: window.innerHeight,
+-                panelHeight: panel.getBoundingClientRect().height,
+             });
+             const next = {
+                 width: layout.width,
+                 maxHeight: layout.maxHeight,
+-                transform: `translate3d(${layout.left - parentRect.left}px, ${layout.top - parentRect.top}px, 0)`,
++                transform: `translate3d(${layout.left}px, ${layout.top}px, 0)`,
+                 opacity: 1,
+             };
+             setStyle(previous => Object.keys(next).every(key => previous[key] === next[key]) ? previous : next);
+@@ -34,11 +34,14 @@ export function usePanelPosition(anchorNode, viewport, panelRef) {
+         reposition();
+         const observer = new ResizeObserver(reposition);
+         observer.observe(panel);
++        if (origin?.offsetParent) observer.observe(origin.offsetParent);
+         window.addEventListener('resize', reposition);
++        document.addEventListener('scroll', reposition, true);
+         return () => {
+             observer.disconnect();
+             window.removeEventListener('resize', reposition);
++            document.removeEventListener('scroll', reposition, true);
+         };
+-    }, [x, y, w, h, zoom, panX, panY, panelRef]);
++    }, [x, y, w, h, zoom, panX, panY, panelRef, expanded, originRef]);
+     return style;
+ }
+diff --git a/frontend/src/components/canvas/generation-panel/utils/panelLayout.js b/frontend/src/components/canvas/generation-panel/utils/panelLayout.js
+index f28e1d7..57bce48 100644
+--- a/frontend/src/components/canvas/generation-panel/utils/panelLayout.js
++++ b/frontend/src/components/canvas/generation-panel/utils/panelLayout.js
+@@ -1,14 +1,14 @@
+-export function getPanelLayout({ anchor, viewportWidth, viewportHeight, panelHeight, preferredWidth = 520, margin = 16 }) {
++export function getPanelLayout({ anchor, viewportWidth, viewportHeight, preferredWidth = 520, margin = 16 }) {
+     const width = Math.min(preferredWidth, Math.max(1, viewportWidth - margin * 2));
+-    const maxHeight = Math.max(1, viewportHeight - margin * 2);
+-    const height = Math.min(panelHeight, maxHeight);
+     const below = anchor.top + anchor.height + margin;
+-    const above = anchor.top - height - margin;
+-    const desiredTop = below + height <= viewportHeight - margin ? below : above;
++    // Keep the anchor relationship even when the node approaches the viewport
++    // edge. The header/fullscreen action remains separate from scrolling content.
++    const viewportCapacity = Math.max(1, viewportHeight - margin * 2);
++    const maxHeight = Math.min(viewportCapacity, Math.max(220, viewportHeight - below - margin));
+     return {
+         width,
+         maxHeight,
+         left: Math.max(margin, Math.min(anchor.left + anchor.width / 2 - width / 2, viewportWidth - width - margin)),
+-        top: Math.max(margin, Math.min(desiredTop, viewportHeight - height - margin)),
++        top: below,
+     };
+ }
+diff --git a/frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js b/frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js
+index 04ff631..2d58714 100644
+--- a/frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js
++++ b/frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js
+@@ -4,21 +4,30 @@ import { getPanelLayout } from './panelLayout.js';
+ 
+ const calculate = (overrides = {}) => getPanelLayout({
+     anchor: { left: 400, top: 100, width: 300, height: 100 },
+-    viewportWidth: 1280, viewportHeight: 800, panelHeight: 300, ...overrides,
++    viewportWidth: 1280, viewportHeight: 800, ...overrides,
+ });
+ test('panel stays below node when it fits', () => assert.equal(calculate().top, 216));
+-test('large asset region moves above a low node', () => {
+-    const layout = calculate({ anchor: { left: 500, top: 650, width: 300, height: 100 }, panelHeight: 500 });
+-    assert.equal(layout.top, 134);
++test('a low node never flips or clamps its panel above the anchor', () => {
++    const layout = calculate({ anchor: { left: 500, top: 650, width: 300, height: 100 } });
++    assert.equal(layout.top, 766);
++    assert.equal(layout.maxHeight, 220);
+ });
+-test('small screens resize the panel and bound both axes', () => {
+-    const layout = calculate({ viewportWidth: 360, viewportHeight: 480, panelHeight: 700 });
+-    assert.deepEqual(layout, { width: 328, maxHeight: 448, left: 16, top: 16 });
++test('small screens resize width and cap content in the space below the node', () => {
++    const layout = calculate({ viewportWidth: 360, viewportHeight: 480 });
++    assert.deepEqual(layout, { width: 328, maxHeight: 248, left: 16, top: 216 });
+ });
+-test('offscreen nodes and viewport resizing never push the panel outside', () => {
++test('horizontal bounds never change the vertical anchor for offscreen nodes', () => {
+     for (const left of [-900, 3000]) {
+         const layout = calculate({ anchor: { left, top: -500, width: 300, height: 100 } });
+         assert.ok(layout.left >= 16 && layout.left + layout.width <= 1264);
+-        assert.equal(layout.top, 16);
++        assert.equal(layout.top, -384);
+     }
+ });
++
++test('window resizing changes available height without moving the panel', () => {
++    const tall = calculate();
++    const short = calculate({ viewportHeight: 400 });
++    assert.equal(tall.top, short.top);
++    assert.ok(short.maxHeight < tall.maxHeight);
++    assert.ok(short.maxHeight >= 220);
++});
+diff --git a/frontend/tests/browser/generation-panel.spec.js b/frontend/tests/browser/generation-panel.spec.js
+index 2fa67e2..8fd0d6b 100644
+--- a/frontend/tests/browser/generation-panel.spec.js
++++ b/frontend/tests/browser/generation-panel.spec.js
+@@ -23,6 +23,12 @@ async function expectWithinViewport(locator, page) {
+     expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
+ }
+ 
++async function expectBelowNode(page) {
++    const node = await page.locator('[data-fixture-node]').boundingBox();
++    const box = await panel(page).boundingBox();
++    expect(box.y).toBeCloseTo(node.y + node.height + 16, 1);
++}
++
+ test('50 mixed assets have three regions, full saved inputs and reachable final asset', async ({ page }) => {
+     await page.goto(fixture);
+     await expect(page.getByRole('region', { name: '图片引用' })).toBeVisible();
+@@ -32,6 +38,7 @@ test('50 mixed assets have three regions, full saved inputs and reachable final
+     await page.getByRole('button', { name: '引用音5', exact: true }).scrollIntoViewIfNeeded();
+     await expect(page.getByRole('button', { name: '引用音5', exact: true })).toBeInViewport();
+     await expectWithinViewport(panel(page), page);
++    await expectBelowNode(page);
+     expect((await state(page)).generation.inputs).toHaveLength(50);
+     await page.screenshot({ path: 'test-results/generation-panel-50-assets.png' });
+ });
+@@ -152,3 +159,71 @@ test('remote parameters hydrate the open panel and loaded prompt has no placehol
+     await page.getByRole('button', { name: '外部更新时长' }).click();
+     await expect(page.getByRole('button', { name: /720p.*8s/ })).toBeVisible();
+ });
++
++test('compact panel stays below low nodes and accounts for the canvas origin', async ({ page }) => {
++    await page.goto(`${fixture}?count=3&nodeY=500&offset=true`);
++    await expectBelowNode(page);
++    await page.getByRole('button', { name: '全屏编辑', exact: true }).click();
++    await expect(panel(page)).toHaveAttribute('data-panel-expanded', 'true');
++    await expectWithinViewport(panel(page), page);
++    await page.getByRole('button', { name: '退出全屏', exact: true }).click();
++    await expectBelowNode(page);
++});
++
++test('fullscreen preserves editor instance, drafts, parameters and reference order', async ({ page }) => {
++    await page.goto(`${fixture}?count=3&mixed=false`);
++    await editor(page).fill('尚未提交的新内容');
++    const editorElement = await editor(page).elementHandle();
++    const before = (await state(page)).generation;
++    await page.getByRole('button', { name: '全屏编辑', exact: true }).click();
++    await expect(page.getByRole('dialog', { name: '生成面板' })).toBeVisible();
++    await expectWithinViewport(panel(page), page);
++    expect(await editorElement.evaluate(element => element === document.querySelector('.ProseMirror'))).toBe(true);
++    await expect(editor(page)).toHaveText('尚未提交的新内容');
++    await editor(page).press('End');
++    await editor(page).pressSequentially('，全屏补充');
++    await page.getByRole('button', { name: '退出全屏', exact: true }).click();
++    expect(await editorElement.evaluate(element => element === document.querySelector('.ProseMirror'))).toBe(true);
++    await expect(editor(page)).toHaveText('尚未提交的新内容，全屏补充');
++    expect((await state(page)).generation.duration).toBe(before.duration);
++    expect((await state(page)).generation.referenceNodeIds).toEqual(before.referenceNodeIds);
++    await expectBelowNode(page);
++});
++
++test('fullscreen Escape closes parameter popup first then exits and restores focus', async ({ page }) => {
++    await page.goto(`${fixture}?count=0`);
++    await page.getByRole('button', { name: '全屏编辑', exact: true }).click();
++    await page.evaluate(() => {
++        window.canvasKeyCount = 0;
++        window.addEventListener('keydown', () => { window.canvasKeyCount += 1; });
++    });
++    await page.getByRole('button', { name: '退出全屏', exact: true }).press('Delete');
++    expect(await page.evaluate(() => window.canvasKeyCount)).toBe(0);
++    await page.getByRole('button', { name: /720p/ }).click();
++    await expectWithinViewport(page.locator('[data-popover-placement]'), page);
++    await page.keyboard.press('Escape');
++    await expect(page.locator('[data-popover-placement]')).toHaveCount(0);
++    await expect(panel(page)).toHaveAttribute('data-panel-expanded', 'true');
++    await page.keyboard.press('Escape');
++    await expect(panel(page)).toHaveAttribute('data-panel-expanded', 'false');
++    await expect(page.getByRole('button', { name: '全屏编辑', exact: true })).toBeFocused();
++    await expect(page.locator('#root')).not.toHaveAttribute('inert');
++    expect(await page.evaluate(() => document.body.style.overflow)).not.toBe('hidden');
++});
++
++test('fullscreen uses available space and survives mobile viewport resizing', async ({ page }) => {
++    await page.setViewportSize({ width: 360, height: 640 });
++    await page.goto(fixture);
++    await page.getByRole('button', { name: '全屏编辑', exact: true }).click();
++    await expectWithinViewport(panel(page), page);
++    const box = await panel(page).boundingBox();
++    expect(box.width).toBe(360);
++    expect(box.height).toBe(640);
++    await page.getByRole('button', { name: '引用音5', exact: true }).scrollIntoViewIfNeeded();
++    await expect(page.getByRole('button', { name: '引用音5', exact: true })).toBeInViewport();
++    await expect(page.getByText('提示词', { exact: true })).toBeVisible();
++    await page.setViewportSize({ width: 1280, height: 800 });
++    await expectWithinViewport(panel(page), page);
++    expect((await editor(page).boundingBox()).height).toBeGreaterThan(300);
++    await page.screenshot({ path: 'test-results/generation-panel-fullscreen.png' });
++});
+diff --git a/frontend/tests/fixtures/generation-panel.jsx b/frontend/tests/fixtures/generation-panel.jsx
+index 19e45b8..4543c07 100644
+--- a/frontend/tests/fixtures/generation-panel.jsx
++++ b/frontend/tests/fixtures/generation-panel.jsx
+@@ -19,7 +19,7 @@ export default function Fixture() {
+     const [open, setOpen] = useState(true);
+     const [submissions, setSubmissions] = useState([]);
+     const [anchor, setAnchor] = useState({
+-        id: 'generator', type: mode, position: { x: 460, y: 420 }, size: { w: 280, h: 180 },
++        id: 'generator', type: mode, position: { x: 460, y: Number(query.get('nodeY') ?? 80) }, size: { w: 280, h: 140 },
+         generation: {
+             model: mode === 'video' ? 'doubao-seedance-2.5' : 'nano-banana-2',
+             prompt: query.get('prompt') ?? (count ? '参考 @图1 与 @图2' : '电影场景'),
+@@ -34,7 +34,9 @@ export default function Fixture() {
+     const removeConnection = useCallback(id => setIncoming(previous => previous.filter(asset => asset.id !== id)), []);
+     const generate = useCallback(payload => setSubmissions(previous => [...previous, payload]), []);
+     return (
+-        <main className="relative w-screen h-screen text-white">
++        <main className="relative w-screen h-screen text-white" style={query.has('offset') ? { marginLeft: 80, marginTop: 60 } : undefined}>
++            <div data-fixture-node aria-label="生成节点" className="absolute rounded-xl border border-neutral-700 bg-neutral-900 text-xs text-neutral-500 flex items-center justify-center"
++                style={{ left: anchor.position.x, top: anchor.position.y, width: anchor.size.w, height: anchor.size.h }}>生成节点</div>
+             <div className="fixed top-0 left-0 z-0 flex flex-wrap gap-2 p-1 text-xs" data-fixture-controls>
+                 <button onClick={() => setOpen(value => !value)}>{open ? '关闭面板' : '打开面板'}</button>
+                 <button onClick={() => removeConnection('asset-0')}>外部断开第一项</button>

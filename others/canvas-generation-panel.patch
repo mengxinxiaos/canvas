@@ -1,0 +1,4389 @@
+From 14e9195250890b3a41a9096c54c5c53dac4e9112 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 2 Nov 2026 11:04:04 +0300
+Subject: [PATCH] Fix generation panel layout, reference integrity and duration
+ controls
+
+---
+ .gitignore                                    |   4 +-
+ .../video_generation/providers/zhenzhen.py    |  40 +-
+ backend/tests/test_video_pricing_context.py   |  12 +-
+ .../tests/test_zhenzhen_reference_limits.py   | 101 +++
+ docs/generation-panel-review.md               |  66 ++
+ frontend/package-lock.json                    |  90 ++-
+ frontend/package.json                         |   5 +-
+ frontend/playwright.config.js                 |  14 +
+ .../generation-panel/GenerationPanel.jsx      | 753 +++---------------
+ .../components/ControlToolbar.jsx             | 104 ++-
+ .../components/MentionTextarea.jsx            | 328 +++-----
+ .../components/PictureTags.jsx                | 402 ++++------
+ .../hooks/useGenerationParams.js              | 328 +++-----
+ .../hooks/usePanelPosition.js                 |  71 +-
+ .../utils/generationParams.js                 |  69 ++
+ .../generation-panel/utils/mentionDocument.js |  31 +
+ .../utils/mentionDocument.test.js             |  62 ++
+ .../generation-panel/utils/panelLayout.js     |  14 +
+ .../utils/panelLayout.test.js                 |  24 +
+ frontend/src/components/ui/Popover.jsx        | 138 ++--
+ frontend/src/components/ui/popoverPosition.js |  25 +
+ .../components/ui/popoverPosition.test.mjs    |  44 +
+ frontend/src/config/models.js                 |   5 +-
+ frontend/src/services/aiGenerationService.js  |  75 +-
+ frontend/src/services/generationSubmission.js | 105 +++
+ .../src/services/generationSubmission.test.js | 154 ++++
+ frontend/src/utils/referenceMedia.js          |  90 +++
+ frontend/src/utils/referenceMedia.test.js     |  51 ++
+ .../tests/browser/generation-panel.spec.js    | 154 ++++
+ frontend/tests/fixtures/generation-panel.html |   1 +
+ frontend/tests/fixtures/generation-panel.jsx  |  61 ++
+ frontend/tests/generationParams.test.mjs      |  51 ++
+ 32 files changed, 1911 insertions(+), 1561 deletions(-)
+ create mode 100644 backend/tests/test_zhenzhen_reference_limits.py
+ create mode 100644 docs/generation-panel-review.md
+ create mode 100644 frontend/playwright.config.js
+ create mode 100644 frontend/src/components/canvas/generation-panel/utils/generationParams.js
+ create mode 100644 frontend/src/components/canvas/generation-panel/utils/mentionDocument.js
+ create mode 100644 frontend/src/components/canvas/generation-panel/utils/mentionDocument.test.js
+ create mode 100644 frontend/src/components/canvas/generation-panel/utils/panelLayout.js
+ create mode 100644 frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js
+ create mode 100644 frontend/src/components/ui/popoverPosition.js
+ create mode 100644 frontend/src/components/ui/popoverPosition.test.mjs
+ create mode 100644 frontend/src/services/generationSubmission.js
+ create mode 100644 frontend/src/services/generationSubmission.test.js
+ create mode 100644 frontend/src/utils/referenceMedia.js
+ create mode 100644 frontend/src/utils/referenceMedia.test.js
+ create mode 100644 frontend/tests/browser/generation-panel.spec.js
+ create mode 100644 frontend/tests/fixtures/generation-panel.html
+ create mode 100644 frontend/tests/fixtures/generation-panel.jsx
+ create mode 100644 frontend/tests/generationParams.test.mjs
+
+diff --git a/.gitignore b/.gitignore
+index f3ae7ab..85e8859 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -52,6 +52,8 @@ pip-wheel-metadata/
+ .ruff_cache/
+ .coverage
+ htmlcov/
++test-results/
++playwright-report/
+ 
+ # 数据库文件 (不要忽略 alembic 文件夹本身)
+ instance/
+@@ -74,4 +76,4 @@ requirements2.txt
+ .idea/
+ .others/
+ .DS_Store
+-Thumbs.db
+\ No newline at end of file
++Thumbs.db
+diff --git a/backend/app/services/video_generation/providers/zhenzhen.py b/backend/app/services/video_generation/providers/zhenzhen.py
+index 09d067a..8ed924c 100644
+--- a/backend/app/services/video_generation/providers/zhenzhen.py
++++ b/backend/app/services/video_generation/providers/zhenzhen.py
+@@ -3,6 +3,29 @@ import httpx
+ from app.core.config import settings
+ from app.services.video_generation.base import BaseVideoClient
+ 
++
++# Limits belong to the requested model, not to the shape of the UI. Keep the
++# legacy per-type limits for other models; Seedance 2.5 accepts 50 references
++# across image, video and audio inputs combined.
++SEEDANCE_25_MAX_REFERENCES = 50
++LEGACY_REFERENCE_LIMITS = {"image": 9, "video": 3, "audio": 3}
++
++
++def _reference_limit_error(model: str, image_count: int, video_count: int, audio_count: int):
++    counts = {"image": image_count, "video": video_count, "audio": audio_count}
++    if model == "doubao-seedance-2.5":
++        total = sum(counts.values())
++        if total > SEEDANCE_25_MAX_REFERENCES:
++            return f"Seedance 2.5 最多支持 {SEEDANCE_25_MAX_REFERENCES} 个引用资产，当前共 {total} 个。请减少引用后重试。"
++        return None
++
++    labels = {"image": "图片", "video": "视频", "audio": "音频"}
++    for media_type, limit in LEGACY_REFERENCE_LIMITS.items():
++        if counts[media_type] > limit:
++            return f"当前模型最多支持 {limit} 个{labels[media_type]}引用，当前为 {counts[media_type]} 个。请减少引用后重试。"
++    return None
++
++
+ class ZhenZhenClient(BaseVideoClient):
+     def __init__(self):
+         super().__init__(provider="zhenzhen")
+@@ -42,6 +65,17 @@ class ZhenZhenClient(BaseVideoClient):
+         first_frame_url = kwargs.get("first_frame_url")
+         last_frame_url = kwargs.get("last_frame_url")
+ 
++        # Validate effective inputs before sending anything. Rejecting overflow
++        # is intentional: slicing would silently change the prompt's references.
++        effective_image_count = (
++            1 + int(bool(last_frame_url)) if first_frame_url else len(image_urls)
++        )
++        reference_error = _reference_limit_error(
++            model, effective_image_count, len(video_urls), len(audio_urls)
++        )
++        if reference_error:
++            return None, reference_error
++
+         # ==========================================
+         # 🚨 即梦专属防线：校验多模态输入规则
+         # ==========================================
+@@ -60,15 +94,15 @@ class ZhenZhenClient(BaseVideoClient):
+         elif first_frame_url:
+             content_list.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
+         else:
+-            for img_url in image_urls[:9]:  # 官方限制最多 9 张
++            for img_url in image_urls:
+                 content_list.append({"type": "image_url", "image_url": {"url": img_url}, "role": "reference_image"})
+                 
+         # 处理视频
+-        for vid_url in video_urls[:3]:  # 官方限制最多 3 个
++        for vid_url in video_urls:
+             content_list.append({"type": "video_url", "video_url": {"url": vid_url}, "role": "reference_video"})
+             
+         # 处理音频
+-        for aud_url in audio_urls[:3]:  # 官方限制最多 3 个
++        for aud_url in audio_urls:
+             content_list.append({"type": "audio_url", "audio_url": {"url": aud_url}, "role": "reference_audio"})
+ 
+         # 3. 拼装 Payload
+diff --git a/backend/tests/test_video_pricing_context.py b/backend/tests/test_video_pricing_context.py
+index 3ae97d0..09997a6 100644
+--- a/backend/tests/test_video_pricing_context.py
++++ b/backend/tests/test_video_pricing_context.py
+@@ -68,18 +68,20 @@ def test_provider_captures_effective_payload_and_actual_response_model(monkeypat
+     assert "reference.mp4" not in str(provider.billing_metadata)
+ 
+ 
+-def test_zhenzhen_counts_only_video_inputs_kept_in_outgoing_payload(monkeypatch):
++def test_zhenzhen_rejects_overflow_instead_of_pricing_a_truncated_payload(monkeypatch):
+     monkeypatch.setattr(settings, "ZHENZHEN_API_KEY", "test-key")
+     provider = ZhenZhenClient()
+ 
+     async def run():
+         async with httpx.AsyncClient(transport=httpx.MockTransport(
+-            lambda _: httpx.Response(200, json={"id": "remote"})
++            lambda _: pytest.fail("An invalid request must not reach the provider")
+         )) as client:
+-            await provider.submit_task(client, "test", "model", video_urls=["a", "b", "c", "d"])
++            return await provider.submit_task(client, "test", "model", video_urls=["a", "b", "c", "d"])
+ 
+-    asyncio.run(run())
+-    assert provider.billing_metadata["parameters_json"]["video_input_count"] == 3
++    task_id, message = asyncio.run(run())
++    assert task_id is None
++    assert "最多支持 3 个视频" in message
++    assert "parameters_json" not in provider.billing_metadata
+ 
+ 
+ @pytest.mark.parametrize("requested_mode,image_count,expected_video", [
+diff --git a/backend/tests/test_zhenzhen_reference_limits.py b/backend/tests/test_zhenzhen_reference_limits.py
+new file mode 100644
+index 0000000..cbddd67
+--- /dev/null
++++ b/backend/tests/test_zhenzhen_reference_limits.py
+@@ -0,0 +1,101 @@
++"""Generation must preserve every accepted reference and reject overflow."""
++import asyncio
++import json
++
++import httpx
++import pytest
++
++from app.core.config import settings
++from app.services.video_generation.providers.zhenzhen import ZhenZhenClient
++
++
++def submit(monkeypatch, model, **inputs):
++    monkeypatch.setattr(settings, "ZHENZHEN_API_KEY", "test-key")
++    provider = ZhenZhenClient()
++    outgoing = []
++
++    def respond(request):
++        outgoing.append(json.loads(request.content))
++        return httpx.Response(200, json={"id": "remote-task"})
++
++    async def run():
++        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
++            return await provider.submit_task(client, "test", model, **inputs)
++
++    result = asyncio.run(run())
++    return provider, result, outgoing
++
++
++@pytest.mark.parametrize("image_count,video_count,audio_count", [(50, 0, 0), (35, 10, 5), (0, 49, 1)])
++def test_seedance_25_sends_all_50_references_in_type_order(monkeypatch, image_count, video_count, audio_count):
++    images = [f"https://example.invalid/image-{i}.png" for i in range(image_count)]
++    videos = [f"https://example.invalid/video-{i}.mp4" for i in range(video_count)]
++    audios = [f"https://example.invalid/audio-{i}.mp3" for i in range(audio_count)]
++    provider, (task_id, _), outgoing = submit(
++        monkeypatch, "doubao-seedance-2.5", image_urls=images, video_urls=videos, audio_urls=audios,
++    )
++    assert task_id == "remote-task"
++    content = outgoing[0]["content"]
++    assert len(content) == 51  # one prompt plus 50 references
++    for media_type, expected in [("image_url", images), ("video_url", videos), ("audio_url", audios)]:
++        assert [item[media_type]["url"] for item in content if item["type"] == media_type] == expected
++    assert provider.billing_metadata["parameters_json"]["video_input_count"] == video_count
++
++
++def test_seedance_25_rejects_51_combined_references_before_network(monkeypatch):
++    _, (task_id, message), outgoing = submit(
++        monkeypatch, "doubao-seedance-2.5", image_urls=["image"] * 40,
++        video_urls=["video"] * 6, audio_urls=["audio"] * 5,
++    )
++    assert task_id is None
++    assert "最多支持 50 个引用资产" in message
++    assert "51" in message
++    assert outgoing == []
++
++
++@pytest.mark.parametrize("media_key,count,label", [("image_urls", 10, "图片"), ("video_urls", 4, "视频"), ("audio_urls", 4, "音频")])
++def test_other_models_reject_per_type_overflow_without_truncating(monkeypatch, media_key, count, label):
++    inputs = {media_key: ["reference"] * count}
++    if media_key == "audio_urls":
++        inputs["image_urls"] = ["image"]
++    _, (task_id, message), outgoing = submit(monkeypatch, "doubao-seedance-2-0-260128", **inputs)
++    assert task_id is None
++    assert f"个{label}引用" in message
++    assert outgoing == []
++
++
++def test_other_models_keep_their_existing_9_image_3_video_3_audio_capacity(monkeypatch):
++    _, (task_id, _), outgoing = submit(
++        monkeypatch, "doubao-seedance-2-0-260128", image_urls=["image"] * 9,
++        video_urls=["video"] * 3, audio_urls=["audio"] * 3,
++    )
++    assert task_id == "remote-task"
++    assert len(outgoing[0]["content"]) == 16
++
++
++def test_seedance_25_preserves_first_last_roles_at_50_reference_boundary(monkeypatch):
++    _, (task_id, _), outgoing = submit(
++        monkeypatch, "doubao-seedance-2.5", first_frame_url="first", last_frame_url="last",
++        video_urls=["video"] * 48,
++    )
++    assert task_id == "remote-task"
++    content = outgoing[0]["content"]
++    assert len(content) == 51
++    assert [item["role"] for item in content if item["type"] == "image_url"] == ["first_frame", "last_frame"]
++
++
++def test_seedance_25_counts_effective_first_and_last_frames(monkeypatch):
++    _, (task_id, message), outgoing = submit(
++        monkeypatch, "doubao-seedance-2.5", first_frame_url="first", last_frame_url="last",
++        video_urls=["video"] * 49,
++    )
++    assert task_id is None
++    assert "51" in message
++    assert outgoing == []
++
++
++def test_seedance_25_keeps_audio_only_validation(monkeypatch):
++    _, (task_id, message), outgoing = submit(monkeypatch, "doubao-seedance-2.5", audio_urls=["audio"])
++    assert task_id is None
++    assert "至少提供1张图片或1个视频" in message
++    assert outgoing == []
+diff --git a/docs/generation-panel-review.md b/docs/generation-panel-review.md
+new file mode 100644
+index 0000000..108f57c
+--- /dev/null
++++ b/docs/generation-panel-review.md
+@@ -0,0 +1,66 @@
++# Generation Panel 改动与检查记录
++
++基线：`mengxinxiaos/canvas`，`d166c804eaa0ca764d0ab2ad562def692a3fdd16`。分支：`fix/generation-panel-scalability`。
++
++## 交互变化
++
++- 图片、视频、音频分为三个区域，保留各类型自己的编号。
++- 资产卡片按可用宽度换行。区域随内容增长，达到视口相关高度后纵向滚动；所有资产保留，不通过裁切数组解决显示问题。
++- Seedance 2.5 显示合计计数与 50 项上限，超过上限可继续查看和移除，但不能提交。视频卡片不批量请求视频，悬停时仅加载一个预览。
++- 同类型拖拽排序；成功放置才保存，取消拖拽不改变顺序。支持 Alt＋方向键排序。
++- 时长使用配置驱动的滑条，“自动”独立选择。当前 2.5 的手动范围为 4–30 秒；切换其他模型时按该模型允许值校正。滑条也能处理非连续时长列表。
++- 面板测量实际高度，在节点上下与视口边缘间定位；窄屏缩小宽度。参数浮层通过 Portal 显示，避开边缘并支持内部滚动。
++
++## 发现并修复的隐藏问题
++
++| 问题 | 影响 | 处理 |
++| --- | --- | --- |
++| ZhenZhen 后端用 `[:9]` / `[:3]` 裁切媒体 | UI 显示已引用，实际部分未发送，提示词编号可能失效 | 2.5 按合计 50 校验并完整传输；其他型号保留原有每类上限，超限明确报错 |
++| 新节点默认 `first_last`，当前所有视频模型只声明 `multi_ref` | 模型列表为空，可提交不支持的模式 | 根据模型能力选择有效模式；不支持的模式按钮禁用 |
++| 旧节点或切换模型保留非法时长、清晰度、比例 | 显示与请求不符合模型配置 | 初始化、交互和外部参数更新均归一化 |
++| 参数保存与提示词/引用保存各自覆盖整份 generation | 新输入、排序或参数可能被旧快照覆盖 | 面板统一写入局部 patch；参数写入移出 React state updater |
++| 外部断线不重映射提示词；关闭期间断线后重开也丢旧编号关系 | `@图N` 指向另一项或失效 | 使用资产 ID 和保存的输入快照映射编号；外部文本与顺序整体接收 |
++| 删除资产保留永久本地 tombstone | 同一资产重新连接后仍不显示 | 以实际连线和保存顺序计算列表，取消永久屏蔽状态 |
++| 多个失效 mention 使用旧文档坐标删除 | 误删邻近文字或事务异常 | 通过 ProseMirror transaction mapping 转换位置 |
++| 编辑器异步回写、过期同步和非订阅占位显示 | 快速 Enter 提交旧文本；旧内容覆盖新内容；占位文字叠加 | 同步更新 prompt ref，取消过期同步，订阅编辑器空状态 |
++| 外部/强制编辑器重绘进入撤销历史 | 排序后撤销可能恢复旧显示编号 | 同步事务不进入本地撤销历史 |
++| 提交服务将 finalPrompt 写回可编辑 prompt | 生成后丢失 @，再次生成重复扩展预设 | 分离 rawPrompt、可编辑 prompt 与 finalPrompt |
++| 宫格模板直接 push 到传入 inputs | 原引用被污染，重复生成累积模板 | 复制引用，仅在请求副本追加图片模板；视频不继承模板 |
++| 显式空 inputs 被当成缺省 | 删除的资产经连线回退重新加入 | 只有未提供 inputs 才回退，[] 表示明确无引用 |
++| 回退只识别图片；同一节点快速重复发送 | 视频/音频丢失，重复创建任务 | 回退统一媒体类型和保存顺序；增加项目＋节点级提交锁 |
++| 空 src 资产显示编号但提交被过滤 | 显示编号与请求编号不一致 | 未完成上传/生成时阻止提交并提示；图片模型媒体类型、音频缺少画面参考也提前提示 |
++| 依赖锁文件与声明不一致 | 干净环境 `npm ci` 失败 | 更新锁文件并验证干净安装 |
++
++## 代码边界
++
++- `src/utils/referenceMedia.js`：媒体类型、编号、顺序、序列化、提示词映射与引用校验的纯函数。
++- `GenerationPanel.jsx`：协调 prompt、引用和参数，用 patch 保存，不复制整份历史 generation。
++- `useGenerationParams`：模型配置约束与参数状态；外部参数变化与 prompt/引用写入分开处理。
++- `PictureTags`：分区展示和拖拽预览；不负责保存提示词或网络提交。
++- `MentionTextarea` / `mentionDocument`：编辑器同步与 ID 关联，不承担模型约束。
++- `generationSubmission`：请求构造、副作用与同步提交锁，和 React、API 导入分离，方便测试。
++
++## 验证
++
++- `npm ci --ignore-scripts --no-audit --no-fund`：通过。
++- `npm test`：32 项通过，覆盖编号/删除/重连、50 项、参数归一化、事务映射、请求输入副本、重复提交锁与浮层定位。
++- `npm run test:browser`：11 项 Chromium 浏览器测试通过，覆盖 50 个混合资产、360px 窄窗口、30s/自动、模型切换、打开与关闭期间断线、键盘排序/撤销、实际拖放/取消、外部文本与顺序同时修改、最新输入提交、加载态阻止 Enter、超限与未就绪引用、外部参数更新及占位显示；同时检查页面运行时异常。
++- 修改文件的 ESLint 与 `git diff --check`：通过。
++- `npm run build`：通过。现有主包体积警告仍存在，本轮未扩展到全站分包。
++- `python -m pytest backend/tests/test_zhenzhen_reference_limits.py backend/tests/test_video_pricing_context.py -q`：22 项通过。
++- 全量后端测试存在 4 项旧计价测试失败；在干净基线复现同样失败（`backend/tests/test_pricing.py` 的原有期望与当前计价规则不一致）。本轮没有修改计价规则。
++
++50 项能力按本次提供的 Seedance 2.5 需求实现；后端用 HTTP mock 检查实际组装的内容完整性，未调用付费生成接口。供应商额外的文件大小、单项媒体时长等约束不在本轮验证范围内。
++
++## 本地验收
++
++```powershell
++cd frontend
++npm ci
++npm test
++npm run build
++npx playwright install chromium
++npm run test:browser
++```
++
++后端测试使用项目 Python 环境，需安装测试依赖 pytest。
+diff --git a/frontend/package-lock.json b/frontend/package-lock.json
+index 71294da..c8e550a 100644
+--- a/frontend/package-lock.json
++++ b/frontend/package-lock.json
+@@ -23,6 +23,7 @@
+       },
+       "devDependencies": {
+         "@eslint/js": "^9.39.1",
++        "@playwright/test": "^1.64.1",
+         "@types/react": "^19.2.7",
+         "@types/react-dom": "^19.2.3",
+         "@vitejs/plugin-react": "^5.1.1",
+@@ -80,7 +81,6 @@
+       "integrity": "sha512-CGOfOJqWjg2qW/Mb6zNsDm+u5vFQ8DxXfbM09z69p5Z6+mE1ikP2jUXw+j42Pf1XTYED2Rni5f95npYeuwMDQA==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@babel/code-frame": "^7.29.0",
+         "@babel/generator": "^7.29.0",
+@@ -932,19 +932,30 @@
+       }
+     },
+     "node_modules/@floating-ui/core": {
+-      "version": "1.7.5",
+-      "resolved": "https://registry.npmmirror.com/@floating-ui/core/-/core-1.7.5.tgz",
+-      "integrity": "sha512-1Ih4WTWyw0+lKyFMcBHGbb5U5FtuHJuujoyyr5zTaWS5EYMeT6Jb2AuDeftsCsEuchO+mM2ij5+q9crhydzLhQ==",
++      "version": "1.8.0",
++      "resolved": "https://registry.npmjs.org/@floating-ui/core/-/core-1.8.0.tgz",
++      "integrity": "sha512-0CIZ5itps/8x7BG8dEIhs53BvCUH2PCoogtakwRTut+Arm58sJooJ0AuZhLw2HJYIR5cMLNPBSS728sPho2khQ==",
+       "license": "MIT",
+       "optional": true,
+       "dependencies": {
+-        "@floating-ui/utils": "^0.2.11"
++        "@floating-ui/utils": "^0.2.12"
++      }
++    },
++    "node_modules/@floating-ui/dom": {
++      "version": "1.8.0",
++      "resolved": "https://registry.npmjs.org/@floating-ui/dom/-/dom-1.8.0.tgz",
++      "integrity": "sha512-yXSrzeHZBTZadLOlfyhCkJHNeLJnHRnRInwdZ40L7ZiaAtrBwoYlsDrX3v5zB1Utk7CLfzcOVnVVWoXEky7Ceg==",
++      "license": "MIT",
++      "optional": true,
++      "dependencies": {
++        "@floating-ui/core": "^1.8.0",
++        "@floating-ui/utils": "^0.2.12"
+       }
+     },
+     "node_modules/@floating-ui/utils": {
+-      "version": "0.2.11",
+-      "resolved": "https://registry.npmmirror.com/@floating-ui/utils/-/utils-0.2.11.tgz",
+-      "integrity": "sha512-RiB/yIh78pcIxl6lLMG0CgBXAZ2Y0eVHqMPYugu+9U0AeT6YBeiJpf7lbdJNIugFP5SIjwNRgo4DhR1Qxi26Gg==",
++      "version": "0.2.12",
++      "resolved": "https://registry.npmjs.org/@floating-ui/utils/-/utils-0.2.12.tgz",
++      "integrity": "sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww==",
+       "license": "MIT",
+       "optional": true
+     },
+@@ -1088,6 +1099,22 @@
+         "node": ">= 8"
+       }
+     },
++    "node_modules/@playwright/test": {
++      "version": "1.64.1",
++      "resolved": "https://registry.npmjs.org/@playwright/test/-/test-1.64.1.tgz",
++      "integrity": "sha512-IaYGml/nSOiZWROfPtuIL7neuu9qDOZ3TNvNljUIrhDMxiGTgPjzj/g9p9RxpS2tSepPDRY+UwAaEeiKtUvIAg==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "dependencies": {
++        "playwright": "1.64.1"
++      },
++      "bin": {
++        "playwright": "cli.js"
++      },
++      "engines": {
++        "node": ">=20"
++      }
++    },
+     "node_modules/@popperjs/core": {
+       "version": "2.11.8",
+       "resolved": "https://registry.npmmirror.com/@popperjs/core/-/core-2.11.8.tgz",
+@@ -1460,7 +1487,6 @@
+       "resolved": "https://registry.npmmirror.com/@tiptap/core/-/core-3.23.6.tgz",
+       "integrity": "sha512-MRB3pHz4Oxqmcawh0cQ5iOGdY5xtNYp/1CoK7hdTLzw5K0C6/gTC2VvanB1R4INaB6EpBkxG/GiWkVirDRnuXw==",
+       "license": "MIT",
+-      "peer": true,
+       "funding": {
+         "type": "github",
+         "url": "https://github.com/sponsors/ueberdosis"
+@@ -1683,7 +1709,6 @@
+       "resolved": "https://registry.npmmirror.com/@tiptap/extension-list/-/extension-list-3.23.6.tgz",
+       "integrity": "sha512-z6vj9+Qht2sjdQkyyHcUpsC/yCIZqTrQiyHDhs/HGKrfvoANyAZGpqdNeKf1wSyjIso+27tQuIH5NDfk8ygyNw==",
+       "license": "MIT",
+-      "peer": true,
+       "funding": {
+         "type": "github",
+         "url": "https://github.com/sponsors/ueberdosis"
+@@ -1804,7 +1829,6 @@
+       "resolved": "https://registry.npmmirror.com/@tiptap/extensions/-/extensions-3.23.6.tgz",
+       "integrity": "sha512-X09/Db1teB+ifXzDGVVFmOeQRx7wTAayE9/280spxpsHkHZvJ5bHRvWIzUzviMIjbBz+NPDIKYPK7gMfh9iaig==",
+       "license": "MIT",
+-      "peer": true,
+       "funding": {
+         "type": "github",
+         "url": "https://github.com/sponsors/ueberdosis"
+@@ -1819,7 +1843,6 @@
+       "resolved": "https://registry.npmmirror.com/@tiptap/pm/-/pm-3.23.6.tgz",
+       "integrity": "sha512-in5CaMaWlJcH2A1q6GJKFtrodE8WLS3M9tIi/f89jPmIVHJShpodC0KZDNyJkrVBQomYk0DEh86Utm6ASXzQww==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "prosemirror-changeset": "^2.3.0",
+         "prosemirror-commands": "^1.6.2",
+@@ -1981,7 +2004,6 @@
+       "resolved": "https://registry.npmjs.org/@types/react/-/react-19.2.14.tgz",
+       "integrity": "sha512-ilcTH/UniCkMdtexkoCN0bI7pMcJDvmQFPvuPvmEaYA/NSfFTAgdUSLAoVjaRJm7+6PvcM+q1zYOwS4wTYMF9w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "csstype": "^3.2.2"
+       }
+@@ -1991,7 +2013,6 @@
+       "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-19.2.3.tgz",
+       "integrity": "sha512-jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ==",
+       "license": "MIT",
+-      "peer": true,
+       "peerDependencies": {
+         "@types/react": "^19.2.0"
+       }
+@@ -2029,7 +2050,6 @@
+       "integrity": "sha512-UVJyE9MttOsBQIDKw1skb9nAwQuR5wuGD3+82K6JgJlm/Y+KI92oNsMNGZCYdDsVtRHSak0pcV5Dno5+4jh9sw==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "bin": {
+         "acorn": "bin/acorn"
+       },
+@@ -2251,7 +2271,6 @@
+         }
+       ],
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "baseline-browser-mapping": "^2.9.0",
+         "caniuse-lite": "^1.0.30001759",
+@@ -2566,7 +2585,6 @@
+       "integrity": "sha512-VmQ+sifHUbI/IcSopBCF/HO3YiHQx/AVd3UVyYL6weuwW+HvON9VYn5l6Zl1WZzPWXPNZrSQpxwkkZ/VuvJZzg==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@eslint-community/eslint-utils": "^4.8.0",
+         "@eslint-community/regexpp": "^4.12.1",
+@@ -3174,7 +3192,6 @@
+       "integrity": "sha512-/imKNG4EbWNrVjoNC/1H5/9GFy+tqjGBHCaSsN+P2RnPqjsLmv6UD3Ej+Kj8nBWaRAwyk7kK5ZUc+OEatnTR3A==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "bin": {
+         "jiti": "bin/jiti.js"
+       }
+@@ -3615,7 +3632,6 @@
+       "integrity": "sha512-5gTmgEY/sqK6gFXLIsQNH19lWb4ebPDLA4SdLP7dsWkIXHWlG66oPuVvXSGFPppYZz8ZDZq0dYYrbHfBCVUb1Q==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": ">=12"
+       },
+@@ -3643,6 +3659,35 @@
+         "node": ">= 6"
+       }
+     },
++    "node_modules/playwright": {
++      "version": "1.64.1",
++      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.64.1.tgz",
++      "integrity": "sha512-HCrVhHr5QQuwYoswEUGTb7gGp522yflbv/ST8nF4sFWGuLjQCt17Q/EubpGGSNKYn1tsTCPZxqHhHCfVURu7UA==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "dependencies": {
++        "playwright-core": "1.64.1"
++      },
++      "bin": {
++        "playwright": "cli.js"
++      },
++      "engines": {
++        "node": ">=20"
++      }
++    },
++    "node_modules/playwright-core": {
++      "version": "1.64.1",
++      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.64.1.tgz",
++      "integrity": "sha512-BC4s8y6SEVA6Q1rSxZTto8hI1KUI3xXlHGZgvGqP4IqPdI/a6FX9H29IDNz7vKo9l21b6LfYosScPL6M3xxyDQ==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "bin": {
++        "playwright-core": "cli.js"
++      },
++      "engines": {
++        "node": ">=20"
++      }
++    },
+     "node_modules/postcss": {
+       "version": "8.5.8",
+       "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.8.tgz",
+@@ -3663,7 +3708,6 @@
+         }
+       ],
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "nanoid": "^3.3.11",
+         "picocolors": "^1.1.1",
+@@ -3982,7 +4026,6 @@
+       "resolved": "https://registry.npmjs.org/react/-/react-19.2.4.tgz",
+       "integrity": "sha512-9nfp2hYpCwOjAN+8TZFGhtWEwgvWHXqESH8qT89AT/lWklpLON22Lc8pEtnpsZz7VmawabSU0gCjnj8aC0euHQ==",
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": ">=0.10.0"
+       }
+@@ -3992,7 +4035,6 @@
+       "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.4.tgz",
+       "integrity": "sha512-AXJdLo8kgMbimY95O2aKQqsz2iWi9jMgKJhRBAxECE4IFxfcazB2LmzloIoibJI3C12IlY20+KFaLv+71bUJeQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "scheduler": "^0.27.0"
+       },
+@@ -4455,7 +4497,6 @@
+       "resolved": "https://registry.npmmirror.com/use-sync-external-store/-/use-sync-external-store-1.6.0.tgz",
+       "integrity": "sha512-Pp6GSwGP/NrPIrxVFAIkOQeyw8lFenOHijQWkUTrDvrF4ALqylP2C/KCkeS9dpUM3KvYRQhna5vt7IL95+ZQ9w==",
+       "license": "MIT",
+-      "peer": true,
+       "peerDependencies": {
+         "react": "^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0"
+       }
+@@ -4482,7 +4523,6 @@
+       "integrity": "sha512-w+N7Hifpc3gRjZ63vYBXA56dvvRlNWRczTdmCBBa+CotUzAPf5b7YMdMR/8CQoeYE5LX3W4wj6RYTgonm1b9DA==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "esbuild": "^0.27.0",
+         "fdir": "^6.5.0",
+@@ -4637,7 +4677,6 @@
+       "resolved": "https://registry.npmjs.org/yjs/-/yjs-13.6.30.tgz",
+       "integrity": "sha512-vv/9h42eCMC81ZHDFswuu/MKzkl/vyq1BhaNGfHyOonwlG4CJbQF4oiBBJPvfdeCt/PlVDWh7Nov9D34YY09uQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "lib0": "^0.2.99"
+       },
+@@ -4669,7 +4708,6 @@
+       "integrity": "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==",
+       "dev": true,
+       "license": "MIT",
+-      "peer": true,
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+       }
+diff --git a/frontend/package.json b/frontend/package.json
+index 0438b2b..509a02b 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -7,7 +7,9 @@
+     "dev": "vite",
+     "build": "vite build",
+     "lint": "eslint .",
+-    "preview": "vite preview"
++    "preview": "vite preview",
++    "test": "node --test src/utils/referenceMedia.test.js src/components/canvas/generation-panel/utils/mentionDocument.test.js src/components/canvas/generation-panel/utils/panelLayout.test.js tests/generationParams.test.mjs src/services/generationSubmission.test.js src/components/ui/popoverPosition.test.mjs",
++    "test:browser": "playwright test"
+   },
+   "dependencies": {
+     "@tiptap/extension-mention": "^3.23.6",
+@@ -25,6 +27,7 @@
+   },
+   "devDependencies": {
+     "@eslint/js": "^9.39.1",
++    "@playwright/test": "^1.64.1",
+     "@types/react": "^19.2.7",
+     "@types/react-dom": "^19.2.3",
+     "@vitejs/plugin-react": "^5.1.1",
+diff --git a/frontend/playwright.config.js b/frontend/playwright.config.js
+new file mode 100644
+index 0000000..0eba9ec
+--- /dev/null
++++ b/frontend/playwright.config.js
+@@ -0,0 +1,14 @@
++import { defineConfig } from '@playwright/test';
++import process from 'node:process';
++
++export default defineConfig({
++    testDir: './tests/browser',
++    use: {
++        baseURL: 'http://127.0.0.1:4173',
++        viewport: { width: 1280, height: 800 },
++        launchOptions: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
++            ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH, args: ['--no-sandbox'] } : {},
++    },
++    webServer: { command: 'npm run dev -- --host 127.0.0.1 --port 4173 --strictPort', url: 'http://127.0.0.1:4173', reuseExistingServer: !process.env.CI },
++    reporter: 'list',
++});
+diff --git a/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx b/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
+index daa6747..f76569b 100644
+--- a/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
++++ b/frontend/src/components/canvas/generation-panel/GenerationPanel.jsx
+@@ -1,680 +1,186 @@
+-// 🌍 核心容器：只负责调度数据的流向
+-
+-import React, {
+-    useState,
+-    useEffect,
+-    useRef,
+-    useMemo,
+-    useCallback
+-} from 'react';
+-
++import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
+ import { usePanelPosition } from './hooks/usePanelPosition';
+ import { useGenerationParams } from './hooks/useGenerationParams';
+-
+ import { buildPresetPrompt } from '../../../utils/promptBuilder';
+ import { getDimensionsByRatio } from '../../../utils/helpers';
+-
++import {
++    getReferenceType, reconcileReferenceOrder, serializeReferenceMedia,
++    remapReferencePrompt, getReferenceSignature, restoreReferenceMedia, getReferenceValidationError,
++} from '../../../utils/referenceMedia';
+ import MentionTextarea from './components/MentionTextarea';
+ import ControlToolbar from './components/ControlToolbar';
+ import PictureTags from './components/PictureTags';
+-
+-import { VIDEO_REFERENCE_MODES } from '../../../config/constants';
++import { VIDEO_REFERENCE_MODES, getAvailableModelsByMode } from '../../../config/constants';
+ 
+ export default function GenerationPanel({
+-    mode,
+-    anchorNode,
+-    incomingNodes,
+-    viewport,
+-    onGenerate,
+-    updateNodeData,
+-    onRemoveConnection
++    mode, anchorNode, incomingNodes, viewport, onGenerate, updateNodeData, onRemoveConnection,
+ }) {
+-    // 🚀 工业级：定义合法的媒体类型常量，防止硬编码漏删
+-    const VIDEO_TYPES = ['video', 'video_media', 'video_node'];
+-    const AUDIO_TYPES = ['audio'];
+-    const IMAGE_TYPES = ['picture', 'image'];
+-
+-    const ALL_REFERENCE_TYPES = [
+-        ...VIDEO_TYPES,
+-        ...AUDIO_TYPES,
+-        ...IMAGE_TYPES
+-    ];
+-
+-    // 纯计算逻辑：根据节点获取面板的绝对定位样式
+-    const panelStyle = usePanelPosition(anchorNode, viewport, incomingNodes.length);
+-
+-    // 维护本地的排序和删除状态
+-    const [mediaOrderIds, setMediaOrderIds] = useState([]);
+-    const [deletedMediaIds, setDeletedMediaIds] = useState(new Set());
+-
+-    // 拖拽排序 / 删除资产后，强制刷新 TipTap 输入框内容
+-    const [promptForceSyncKey, setPromptForceSyncKey] = useState(0);
+-
+-    // 创建一个 Ref 用于调用 MentionTextarea 内部的方法
++    const panelRef = useRef(null);
+     const mentionTextareaRef = useRef(null);
+-
+-    // UI 交互状态
++    const panelStyle = usePanelPosition(anchorNode, viewport, panelRef);
+     const [prompt, setPrompt] = useState(anchorNode.generation?.prompt ?? '');
+-
+-    // 用 ref 实时追踪最新 prompt，避免闭包拿到旧值
+     const promptRef = useRef(prompt);
+-    
+-    useEffect(() => {
+-        const nextPrompt = anchorNode.generation?.prompt ?? '';
+-
+-        if (nextPrompt !== promptRef.current) {
+-            setPrompt(nextPrompt);
+-            promptRef.current = nextPrompt;
+-
+-            // 强制 MentionTextarea 同步外部变更后的内容
+-            setPromptForceSyncKey((prev) => prev + 1);
+-
+-            /*
+-            console.group('[AgentDebug] GenerationPanel prompt synced');
+-            console.log('nodeId:', anchorNode.id);
+-            console.log('nextPrompt:', nextPrompt);
+-            console.groupEnd();
+-            */
+-        }
+-    }, [
+-        anchorNode.id,
+-        anchorNode.generation?.prompt,
+-    ]);
+-    
+-    useEffect(() => {
+-        promptRef.current = prompt;
+-    }, [prompt]);
+-
+-    // 用 ref 追踪最新 generation，避免 updateNodeData 后闭包仍使用旧数据
+-    const generationRef = useRef(anchorNode.generation || {});
+-
+-    useEffect(() => {
+-        generationRef.current = anchorNode.generation || {};
+-    }, [anchorNode.generation]);
+-
+-    // 接收从 PictureTags 传来的点击资产事件，命令输入框插入它
+-    const handleInsertMedia = useCallback((media) => {
+-        mentionTextareaRef.current?.insertMention?.(media);
+-    }, []);
+-
+-    // 判断媒体基础类型
+-    const getReferenceBaseType = useCallback((media) => {
+-        if (!media?.type) return 'image';
+-
+-        if (VIDEO_TYPES.includes(media.type) || media.type.includes('video')) {
+-            return 'video';
+-        }
+-
+-        if (AUDIO_TYPES.includes(media.type) || media.type.includes('audio')) {
+-            return 'audio';
+-        }
+-
+-        return 'image';
+-    }, []);
+-
+-    // 将当前引用资产序列化为后端真正需要的数据
+-    // 注意：顺序必须来自 inputMedia / inputMediaRef.current，不能来自 incomingNodes 原始顺序
+-    const formatReferenceInputs = useCallback((mediaList) => {
+-        return mediaList
+-            .map(n => ({
+-                id: n.id,
+-                url: n.src,
+-                type: getReferenceBaseType(n),
+-            }))
+-            .filter(media => Boolean(media.url));
+-    }, [getReferenceBaseType]);
+-
+-    // 根据媒体列表计算每个资产当前显示标签：
+-    // 图片：图1 / 图2
+-    // 视频：视1 / 视2
+-    // 音频：音1 / 音2
+-    const getMediaLabelMap = useCallback((mediaList) => {
+-        let imgCount = 0;
+-        let vidCount = 0;
+-        let audCount = 0;
+-
+-        const map = {};
+-
+-        mediaList.forEach((media) => {
+-            let label = '';
+-
+-            if (VIDEO_TYPES.includes(media.type) || media.type?.includes('video')) {
+-                vidCount += 1;
+-                label = `视${vidCount}`;
+-            } else if (AUDIO_TYPES.includes(media.type) || media.type?.includes('audio')) {
+-                audCount += 1;
+-                label = `音${audCount}`;
+-            } else {
+-                imgCount += 1;
+-                label = `图${imgCount}`;
+-            }
+-
+-            map[media.id] = label;
+-        });
++    const observedPromptRef = useRef(anchorNode.generation?.prompt ?? '');
++    const lastWrittenPromptRef = useRef(null);
++    const [promptForceSyncKey, setPromptForceSyncKey] = useState(0);
++    const [activePopover, setActivePopover] = useState(null);
+ 
+-        return map;
++    // All writers send patches. An old generation snapshot must never overwrite
++    // parameters, references or text written by another interaction.
++    const persistGeneration = useCallback((patch = {}) => {
++        const generation = { prompt: promptRef.current, ...patch };
++        lastWrittenPromptRef.current = generation.prompt;
++        updateNodeData(anchorNode.id, { generation });
++    }, [anchorNode.id, updateNodeData]);
++
++    const handlePromptChange = useCallback((value) => {
++        const next = typeof value === 'function' ? value(promptRef.current) : value;
++        promptRef.current = next;
++        setPrompt(next);
+     }, []);
+ 
+-    // 拖拽排序后，重新映射 prompt 中的 @图N / @视N / @音N
+-    // 目标：资产语义不变，只改变显示编号
+-    const remapPromptByMediaOrder = useCallback((oldPrompt, oldMediaList, newMediaList) => {
+-        if (!oldPrompt) return oldPrompt;
+-
+-        const oldLabelMap = getMediaLabelMap(oldMediaList);
+-        const newLabelMap = getMediaLabelMap(newMediaList);
+-
+-        const labelRemap = {};
+-
+-        oldMediaList.forEach((media) => {
+-            const oldLabel = oldLabelMap[media.id];
+-            const newLabel = newLabelMap[media.id];
+-
+-            if (oldLabel && newLabel) {
+-                labelRemap[oldLabel] = newLabel;
+-            }
+-        });
+-
+-        return oldPrompt.replace(/@([图视音]\d+)/g, (match, oldLabel) => {
+-            const newLabel = labelRemap[oldLabel];
+-            return newLabel ? `@${newLabel}` : match;
+-        });
+-    }, [getMediaLabelMap]);
+-
+-    // 删除资产后，重新映射 prompt 中的 @图N / @视N / @音N
+-    // 目标：
+-    // 1. 被删除资产对应的 @图N 不能继续保留，否则会误绑定到后续资产
+-    // 2. 仍然存在的资产要根据新编号继续保持语义
+-    const remapPromptAfterDelete = useCallback((oldPrompt, oldMediaList, newMediaList, deletedId) => {
+-        if (!oldPrompt) return oldPrompt;
+-
+-        const oldLabelMap = getMediaLabelMap(oldMediaList);
+-        const newLabelMap = getMediaLabelMap(newMediaList);
+-
+-        const labelRemap = {};
+-        const deletedLabels = new Set();
+-
+-        oldMediaList.forEach((media) => {
+-            const oldLabel = oldLabelMap[media.id];
+-
+-            if (!oldLabel) return;
+-
+-            if (media.id === deletedId) {
+-                deletedLabels.add(oldLabel);
+-                return;
+-            }
+-
+-            const newLabel = newLabelMap[media.id];
+-
+-            if (newLabel) {
+-                labelRemap[oldLabel] = newLabel;
+-            }
+-        });
+-
+-        return oldPrompt.replace(/@([图视音]\d+)/g, (match, oldLabel) => {
+-            if (deletedLabels.has(oldLabel)) {
+-                return ``;
+-            }
+-
+-            const newLabel = labelRemap[oldLabel];
+-
+-            return newLabel ? `@${newLabel}` : match;
+-        });
+-    }, [getMediaLabelMap]);
+-
+-    // 统一写回引用资产数据
+-    // 这里不依赖 syncToNode，避免旧 generation 覆盖最新引用顺序
+-    const persistReferenceInputs = useCallback((mediaList, extraGeneration = {}) => {
+-        const referenceNodeIds = mediaList.map(n => n.id);
+-        const inputs = formatReferenceInputs(mediaList);
+-
+-        const nextGeneration = {
+-            ...(generationRef.current || {}),
+-            prompt: promptRef.current,
+-            inputs,
+-            referenceNodeIds,
+-            ...extraGeneration,
+-        };
+-
+-        updateNodeData(anchorNode.id, {
+-            generation: nextGeneration,
+-        });
+-
+-        generationRef.current = nextGeneration;
+-    }, [
+-        anchorNode.id,
+-        formatReferenceInputs,
+-        updateNodeData
+-    ]);
+-
+-    // ✅ 初始化 / 合并外部连线与本地顺序
+-    // 关键：
+-    // 1. 重新打开 panel 时，优先使用 generation.referenceNodeIds 恢复用户排序
+-    // 2. 新连进来的资产追加到末尾
+-    // 3. 已断开的资产自动移除
++    // Debounce typing writes; closing still flushes the latest prompt.
+     useEffect(() => {
+-        const currentValidNodes = incomingNodes.filter(n =>
+-            ALL_REFERENCE_TYPES.includes(n.type)
+-        );
+-
+-        const currentIds = currentValidNodes.map(n => n.id);
+-
+-        const savedReferenceNodeIds = Array.isArray(anchorNode.generation?.referenceNodeIds)
+-            ? anchorNode.generation.referenceNodeIds
+-            : [];
+-
+-        setMediaOrderIds(prev => {
+-            const hasLocalOrder = prev.length > 0;
+-
+-            const baseOrder = hasLocalOrder
+-                ? prev
+-                : savedReferenceNodeIds;
+-
+-            const existingOrdered = baseOrder.filter(id =>
+-                currentIds.includes(id) && !deletedMediaIds.has(id)
+-            );
+-
+-            const newIds = currentIds.filter(id =>
+-                !existingOrdered.includes(id) && !deletedMediaIds.has(id)
+-            );
+-
+-            const nextOrder = [...existingOrdered, ...newIds];
+-
+-            const prevSignature = prev.join('|');
+-            const nextSignature = nextOrder.join('|');
+-
+-            if (prevSignature === nextSignature) {
+-                return prev;
+-            }
+-
+-            return nextOrder;
+-        });
+-    }, [
+-        incomingNodes,
+-        deletedMediaIds,
+-        anchorNode.generation?.referenceNodeIds
+-    ]);
+-
+-    // ✅ 最终用于传递的媒体列表，基于本地排序后的 IDs
+-    const inputMedia = useMemo(() => {
+-        return mediaOrderIds
+-            .map(id => incomingNodes.find(n => n.id === id))
+-            .filter(Boolean);
+-    }, [mediaOrderIds, incomingNodes]);
+-
+-    // 用 ref 保存最新 inputMedia，解决拖拽连续触发时闭包滞后的问题
+-    const inputMediaRef = useRef(inputMedia);
+-
+-    useEffect(() => {
+-        inputMediaRef.current = inputMedia;
+-    }, [inputMedia]);
+-
+-    const hasMediaInput = useMemo(() => {
+-        return inputMedia.some(n =>
+-            VIDEO_TYPES.includes(n.type) ||
+-            AUDIO_TYPES.includes(n.type) ||
+-            n.type?.includes('video') ||
+-            n.type?.includes('audio')
+-        );
+-    }, [inputMedia]);
+-
+-    const inputPicturesCount = useMemo(() => {
+-        return inputMedia.filter(n =>
+-            IMAGE_TYPES.includes(n.type)
+-        ).length;
+-    }, [inputMedia]);
+-
+-    // 状态中心：只管理模型、比例、时长、风格等参数
+-    // 注意：syncToNode 不再负责引用资产顺序
+-    const { params, updateParam, config } = useGenerationParams(
+-        anchorNode,
+-        mode,
+-        updateNodeData,
+-        inputPicturesCount,
+-        hasMediaInput
+-    );
+-
+-    // ✅ 排序回调
+-    // PictureTags 已改为拖拽结束后才调用 onReorder，所以这里正常只执行一次。
+-    const handleReorder = useCallback((newList) => {
+-        const oldInputMedia = inputMediaRef.current;
+-
+-        const prevSignature = oldInputMedia.map(m => m.id).join('|');
+-        const nextSignature = newList.map(m => m.id).join('|');
+-
+-        // 顺序没有变化，不做 prompt 重映射、不写节点、不刷新 TipTap
+-        if (prevSignature === nextSignature) {
+-            return;
+-        }
+-
+-        const newInputMedia = newList;
+-
+-        const nextPrompt = remapPromptByMediaOrder(
+-            promptRef.current,
+-            oldInputMedia,
+-            newInputMedia
+-        );
+-
+-        const nextIds = newInputMedia.map(m => m.id);
+-
+-        inputMediaRef.current = newInputMedia;
+-        promptRef.current = nextPrompt;
+-
+-        setMediaOrderIds(nextIds);
+-        setPrompt(nextPrompt);
+-
+-        // 强制 MentionTextarea 刷新 TipTap 内容
+-        setPromptForceSyncKey(prev => prev + 1);
+-
+-        persistReferenceInputs(newInputMedia, {
++        const timer = window.setTimeout(() => persistGeneration(), 400);
++        return () => window.clearTimeout(timer);
++    }, [prompt, persistGeneration]);
++    useEffect(() => () => persistGeneration(), [persistGeneration]);
++
++    const inputMedia = useMemo(() => reconcileReferenceOrder(
++        incomingNodes, anchorNode.generation?.referenceNodeIds,
++    ), [incomingNodes, anchorNode.generation?.referenceNodeIds]);
++    const inputMediaRef = useRef(restoreReferenceMedia(anchorNode.generation, inputMedia));
++    const lastReferenceSignatureRef = useRef(null);
++
++    // UI reorder/delete and external edge changes share the same ID remapping.
++    // Disconnected assets have no permanent tombstone, so reconnecting works.
++    const syncReferences = useCallback((nextMedia) => {
++        const signature = getReferenceSignature(nextMedia);
++        if (lastReferenceSignatureRef.current === signature) return;
++        const nextPrompt = remapReferencePrompt(promptRef.current, inputMediaRef.current, nextMedia);
++        inputMediaRef.current = nextMedia;
++        lastReferenceSignatureRef.current = signature;
++        if (nextPrompt !== promptRef.current) handlePromptChange(nextPrompt);
++        setPromptForceSyncKey(key => key + 1);
++        persistGeneration({
+             prompt: nextPrompt,
+-            referenceNodeIds: nextIds,
+-            inputs: formatReferenceInputs(newInputMedia),
++            inputs: serializeReferenceMedia(nextMedia),
++            referenceNodeIds: nextMedia.map(media => media.id),
+         });
+-    }, [
+-        formatReferenceInputs,
+-        persistReferenceInputs,
+-        remapPromptByMediaOrder
+-    ]);
+-
+-    // ✅ 删除回调
+-    // 删除中间资产时，后面的图N会前移，所以 prompt 必须重映射。
+-    // 被删除资产对应的 @图N 要替换成【已删除引用：图N】，避免误绑定到新的图N。
+-    const handleDeleteMedia = useCallback((id) => {
+-        const oldInputMedia = inputMediaRef.current;
+-        const nextInputMedia = oldInputMedia.filter(media => media.id !== id);
+-
+-        const nextPrompt = remapPromptAfterDelete(
+-            promptRef.current,
+-            oldInputMedia,
+-            nextInputMedia,
+-            id
+-        );
+-
+-        const nextIds = nextInputMedia.map(media => media.id);
+-
+-        inputMediaRef.current = nextInputMedia;
+-        promptRef.current = nextPrompt;
+-
+-        setDeletedMediaIds(prev => {
+-            const next = new Set(prev);
+-            next.add(id);
+-            return next;
+-        });
+-
+-        setMediaOrderIds(nextIds);
+-        setPrompt(nextPrompt);
+-
+-        // 删除后编号关系也变了，必须强制刷新 TipTap
+-        setPromptForceSyncKey(prev => prev + 1);
+-
+-        persistReferenceInputs(nextInputMedia, {
+-            prompt: nextPrompt,
+-            inputs: formatReferenceInputs(nextInputMedia),
+-            referenceNodeIds: nextIds,
+-        });
+-
+-        if (typeof onRemoveConnection === 'function') {
+-            onRemoveConnection(id, anchorNode.id);
++    }, [handlePromptChange, persistGeneration]);
++
++    useLayoutEffect(() => {
++        const savedPrompt = anchorNode.generation?.prompt ?? '';
++        const changed = observedPromptRef.current !== savedPrompt;
++        observedPromptRef.current = savedPrompt;
++        // Receive an external prompt and its reference order as one snapshot.
++        // Own save acknowledgements must not overwrite newer unsaved typing.
++        if (changed && savedPrompt !== lastWrittenPromptRef.current && savedPrompt !== promptRef.current) {
++            inputMediaRef.current = restoreReferenceMedia(anchorNode.generation, inputMedia);
++            // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronizing an external document snapshot
++            handlePromptChange(savedPrompt);
++            setPromptForceSyncKey(key => key + 1);
+         }
+-    }, [
+-        anchorNode.id,
+-        formatReferenceInputs,
+-        onRemoveConnection,
+-        persistReferenceInputs,
+-        remapPromptAfterDelete
+-    ]);
+-
+-    // 外部新增 / 移除连线后，把当前引用资产列表同步进节点数据层
+-    const lastPersistedReferenceSignatureRef = useRef('');
+-
+-    useEffect(() => {
+-        const signature = inputMedia
+-            .map(n => `${n.id}:${n.type}:${n.src}`)
+-            .join('|');
+-
+-        if (signature === lastPersistedReferenceSignatureRef.current) {
+-            return;
+-        }
+-
+-        lastPersistedReferenceSignatureRef.current = signature;
+-
+-        persistReferenceInputs(inputMedia);
+-    }, [
+-        inputMedia,
+-        persistReferenceInputs
+-    ]);
+-
+-    // 参数更新
+-    const handleUpdateParam = useCallback((key, val) => {
+-        updateParam(key, val);
++        syncReferences(inputMedia);
++    }, [anchorNode.generation, inputMedia, syncReferences, handlePromptChange]);
+ 
+-        // 修改比例时，同步画布物理尺寸
+-        if (key === 'aspectRatio' && val !== 'auto' && val !== 'free') {
+-            const newSize = getDimensionsByRatio(val, 360);
+-
+-            const latestInputMedia = inputMediaRef.current;
+-            const inputs = formatReferenceInputs(latestInputMedia);
+-            const referenceNodeIds = latestInputMedia.map(n => n.id);
+-
+-            const nextGeneration = {
+-                ...(generationRef.current || {}),
+-                prompt: promptRef.current,
+-                inputs,
+-                referenceNodeIds,
+-                aspectRatio: val,
+-            };
+-
+-            updateNodeData(anchorNode.id, {
+-                size: newSize,
+-                generation: nextGeneration,
+-            });
++    const inputPicturesCount = inputMedia.filter(media => getReferenceType(media) === 'image').length;
++    const hasMediaInput = inputMedia.some(media => getReferenceType(media) !== 'image');
++    const { params, updateParam, config, getParams } = useGenerationParams(
++        anchorNode, mode, updateNodeData, inputPicturesCount, hasMediaInput, persistGeneration,
++    );
+ 
+-            generationRef.current = nextGeneration;
++    const handleUpdateParam = useCallback((key, value) => {
++        const next = updateParam(key, value);
++        if (key === 'aspectRatio' && next.aspectRatio !== 'auto' && next.aspectRatio !== 'free') {
++            updateNodeData(anchorNode.id, { size: getDimensionsByRatio(next.aspectRatio, 360) });
+         }
+-    }, [
+-        anchorNode.id,
+-        formatReferenceInputs,
+-        updateNodeData,
+-        updateParam
+-    ]);
+-
+-    // 面板关闭时，把最新 prompt 和引用资产顺序一起保存进节点
+-    // 不再使用 syncToNode，避免旧 generation 覆盖引用顺序
+-    useEffect(() => {
+-        return () => {
+-            const latestInputMedia = inputMediaRef.current;
+-            const inputs = formatReferenceInputs(latestInputMedia);
+-            const referenceNodeIds = latestInputMedia.map(n => n.id);
++    }, [anchorNode.id, updateNodeData, updateParam]);
+ 
+-            const nextGeneration = {
+-                ...(generationRef.current || {}),
+-                prompt: promptRef.current,
+-                inputs,
+-                referenceNodeIds,
+-            };
++    const handleDeleteMedia = useCallback((id) => {
++        syncReferences(inputMediaRef.current.filter(media => media.id !== id));
++        onRemoveConnection?.(id, anchorNode.id);
++    }, [anchorNode.id, onRemoveConnection, syncReferences]);
+ 
+-            updateNodeData(anchorNode.id, {
+-                generation: nextGeneration,
+-            });
++    const validationError = getReferenceValidationError(inputMedia, mode, config);
+ 
+-            generationRef.current = nextGeneration;
+-        };
+-    }, [
+-        anchorNode.id,
+-        formatReferenceInputs,
+-        updateNodeData
+-    ]);
+-
+-    const [activePopover, setActivePopover] = useState(null);
+-    const popoverRef = useRef(null);
+-
+-    // 发送逻辑
+-    // 关键：点击生成时，不再调用 syncToNode 保存引用资产。
+-    // 引用资产顺序只相信 inputMediaRef.current。
+     const handleSend = useCallback(() => {
++        if (anchorNode._isLoading || validationError) return;
+         const latestPrompt = promptRef.current;
+-
+-        if (!latestPrompt && mode !== 'video') return;
+-
++        if (!latestPrompt.trim() && mode !== 'video') return;
+         setActivePopover(null);
+-
+-        const latestInputMedia = inputMediaRef.current;
+-
+-        const formattedInputs = formatReferenceInputs(latestInputMedia);
+-        const referenceNodeIds = latestInputMedia.map(n => n.id);
+-
+-        const typeMap = {
+-            图: '图',
+-            视: '视频',
+-            音: '音频',
+-        };
+-
+-        const cleanPrompt = latestPrompt.replace(/@([图视音])(\d+)/g, (_, type, num) => {
+-            return `${typeMap[type]}${num}`;
+-        });
+-
++        const latestMedia = inputMediaRef.current;
++        const latestParams = getParams();
++        const cleanPrompt = latestPrompt.replace(/@([图视音])(\d+)/g, (_, type, num) => (
++            `${{ 图: '图', 视: '视频', 音: '音频' }[type]}${num}`
++        ));
+         const finalPrompt = mode === 'image'
+-            ? buildPresetPrompt(cleanPrompt, params.gridMode, params.imageStyle)
+-            : cleanPrompt;
+-
+-        const nextGeneration = {
+-            ...(generationRef.current || {}),
+-
+-            // 参数
+-            ...params,
+-
+-            // prompt
+-            prompt: latestPrompt,
++            ? buildPresetPrompt(cleanPrompt, latestParams.gridMode, latestParams.imageStyle) : cleanPrompt;
++        const generation = {
++            ...latestParams,
+             rawPrompt: latestPrompt,
+             finalPrompt,
+-
+-            // 模型
+-            model: mode === 'image'
+-                ? params.imageModel
+-                : params.videoModel,
+-
+-            apiMode: mode === 'video'
+-                ? params.videoRefMode
+-                : 'imageRefMode',
+-
+-            // 最重要：使用最新顺序
+-            inputs: formattedInputs,
+-            referenceNodeIds,
+-        };
+-
+-        updateNodeData(anchorNode.id, {
+-            generation: nextGeneration,
+-        });
+-
+-        // 立刻刷新 ref，防止关闭 panel 时旧数据再次覆盖
+-        generationRef.current = nextGeneration;
+-
+-        onGenerate({
+-            ...params,
+-            prompt: finalPrompt,
+-            rawPrompt: latestPrompt,
+-            model: mode === 'image'
+-                ? params.imageModel
+-                : params.videoModel,
+-            nodeId: anchorNode.id,
+-            apiMode: mode === 'video'
+-                ? params.videoRefMode
+-                : 'imageRefMode',
+-            inputs: formattedInputs,
+-            referenceNodeIds,
+-        });
+-    }, [
+-        anchorNode.id,
+-        formatReferenceInputs,
+-        mode,
+-        onGenerate,
+-        params,
+-        updateNodeData
+-    ]);
+-
+-    // 全局点击外部关闭弹窗
+-    useEffect(() => {
+-        const handleClickOutside = (e) => {
+-            if (popoverRef.current && !popoverRef.current.contains(e.target)) {
+-                setActivePopover(null);
+-            }
++            model: mode === 'image' ? latestParams.imageModel : latestParams.videoModel,
++            apiMode: mode === 'video' ? latestParams.videoRefMode : 'imageRefMode',
++            inputs: serializeReferenceMedia(latestMedia),
++            referenceNodeIds: latestMedia.map(media => media.id),
+         };
++        persistGeneration({ ...generation, prompt: latestPrompt });
++        onGenerate({ ...generation, nodeId: anchorNode.id, prompt: finalPrompt });
++    }, [anchorNode._isLoading, anchorNode.id, validationError, mode, getParams, persistGeneration, onGenerate]);
+ 
+-        if (activePopover) {
+-            document.addEventListener('pointerdown', handleClickOutside, true);
+-        }
+-
+-        return () => {
+-            document.removeEventListener('pointerdown', handleClickOutside, true);
+-        };
+-    }, [activePopover]);
+-
+-    const stopInteraction = (e) => e.stopPropagation();
+-
++    const stopInteraction = event => event.stopPropagation();
+     return (
+         <div
++            ref={panelRef}
+             data-panel-for={anchorNode.id}
+-            className="no-wheel no-drag absolute top-0 left-0 w-[520px] bg-[#212121] rounded-3xl shadow-[0_24px_60px_-15px_rgba(0,0,0,0.9)] border border-white/10 flex flex-col z-[100] p-4 pointer-events-auto"
++            aria-label="生成面板"
++            className="no-wheel no-drag absolute top-0 left-0 bg-[#212121] rounded-3xl shadow-[0_24px_60px_-15px_rgba(0,0,0,0.9)] border border-white/10 flex flex-col z-[100] p-4 pointer-events-auto overflow-y-auto overscroll-contain"
+             style={panelStyle}
+             onPointerDown={stopInteraction}
+             onWheel={stopInteraction}
+         >
+-            {/* 顶部视频模式切换 Tabs */}
+             {mode === 'video' && (
+-                <div className="flex items-center gap-2 mb-4 overflow-x-auto no-scrollbar">
+-                    {VIDEO_REFERENCE_MODES.map(m => {
+-                        const isFirstLast = m.value === 'first_last';
+-
+-                        // 含媒体或图片 ≥ 3 张时，禁用首尾帧
+-                        const isDisabled = isFirstLast && (
+-                            inputMedia.length >= 3 || hasMediaInput
+-                        );
+-
+-                        const isActive = params.videoRefMode === m.value;
+-
++                <div className="flex shrink-0 items-center gap-2 mb-4 overflow-x-auto">
++                    {VIDEO_REFERENCE_MODES.map(referenceMode => {
++                        const disabled = getAvailableModelsByMode('video', referenceMode.value).length === 0
++                            || (referenceMode.value === 'first_last' && (inputPicturesCount >= 3 || hasMediaInput));
+                         return (
+                             <button
+-                                key={m.value}
+-                                disabled={isDisabled}
+-                                onClick={() => handleUpdateParam('videoRefMode', m.value)}
+-                                className={`shrink-0 px-3.5 py-1.5 rounded-xl text-[13px] font-medium transition-all border ${
+-                                    isActive
+-                                        ? 'bg-[#333] text-white border-neutral-500 shadow-sm'
+-                                        : 'bg-transparent text-neutral-400 border-white/5 hover:bg-[#2a2a2a] hover:text-neutral-200'
+-                                } ${isDisabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`}
+-                            >
+-                                {m.label}
+-                            </button>
++                                key={referenceMode.value}
++                                type="button"
++                                disabled={disabled}
++                                title={disabled ? '当前模型或引用资产不支持此模式' : undefined}
++                                onClick={() => handleUpdateParam('videoRefMode', referenceMode.value)}
++                                className={`shrink-0 px-3.5 py-1.5 rounded-xl text-[13px] font-medium border transition-colors ${
++                                    params.videoRefMode === referenceMode.value ? 'bg-[#333] text-white border-neutral-500'
++                                        : 'text-neutral-400 border-white/5 hover:bg-[#2a2a2a]'
++                                } disabled:opacity-40 disabled:cursor-not-allowed`}
++                            >{referenceMode.label}</button>
+                         );
+                     })}
+                 </div>
+             )}
+-
+-            {/* 顶栏：输入媒体引用标签 */}
+-            {inputMedia.length > 0 && (
+-                <PictureTags
+-                    pictures={inputMedia}
+-                    mode={mode}
+-                    videoRefMode={params.videoRefMode}
+-                    onReorder={handleReorder}
+-                    onDelete={handleDeleteMedia}
+-                    onInsert={handleInsertMedia}
+-                />
+-            )}
+-
+-            {/* 中间：自适应高阶输入框，@ 联想引擎 */}
++            <PictureTags
++                pictures={inputMedia}
++                mode={mode}
++                videoRefMode={params.videoRefMode}
++                maxAssets={config.maxReferenceAssets}
++                onReorder={syncReferences}
++                onDelete={handleDeleteMedia}
++                onInsert={media => mentionTextareaRef.current?.insertMention?.(media)}
++            />
+             <MentionTextarea
+                 ref={mentionTextareaRef}
+                 prompt={prompt}
+-                setPrompt={setPrompt}
++                setPrompt={handlePromptChange}
+                 mode={mode}
+                 inputMedia={inputMedia}
+                 onSend={handleSend}
+                 forceSyncKey={promptForceSyncKey}
+             />
+-
+-            {/* 底栏：模型与参数控制条 */}
+-            <div ref={popoverRef} className="relative">
++            {validationError && <p role="alert" className="text-xs text-amber-400 mb-3">{validationError}</p>}
++            <div className="relative shrink-0">
+                 <ControlToolbar
+                     mode={mode}
+                     params={params}
+@@ -684,9 +190,8 @@ export default function GenerationPanel({
+                     setActivePopover={setActivePopover}
+                     onSend={handleSend}
+                     isLoading={anchorNode._isLoading}
+-                    isPromptEmpty={!prompt}
+-                    inputPictureCount={inputPicturesCount}
+-                    hasMediaInput={hasMediaInput}
++                    isPromptEmpty={!prompt.trim()}
++                    isSendBlocked={Boolean(validationError)}
+                 />
+             </div>
+         </div>
+diff --git a/frontend/src/components/canvas/generation-panel/components/ControlToolbar.jsx b/frontend/src/components/canvas/generation-panel/components/ControlToolbar.jsx
+index 969b0bd..c33cf12 100644
+--- a/frontend/src/components/canvas/generation-panel/components/ControlToolbar.jsx
++++ b/frontend/src/components/canvas/generation-panel/components/ControlToolbar.jsx
+@@ -1,9 +1,10 @@
+-import React from 'react';
+-import { 
+-    ArrowUp, Loader2, Video, Settings2, AlertTriangle, 
+-    Info, Maximize, LayoutGrid 
++import React, { useId } from 'react';
++import {
++    ArrowUp, Loader2, Video, Settings2, AlertTriangle,
++    Info, Maximize, LayoutGrid
+ } from 'lucide-react';
+-import Popover from '../../../ui/Popover'; 
++import Popover from '../../../ui/Popover';
++import { getManualDurations } from '../utils/generationParams';
+ import { IMAGE_MODELS, VIDEO_MODELS, GRID_MODES, IMAGE_STYLES, getAvailableModelsByMode } from '../../../../config/constants';
+ 
+ /**
+@@ -14,7 +15,7 @@ const RatioIcon = ({ ratio, isActive }) => {
+     // 💡 修复：安全回退使用原生字符串 'auto' 和 'free'，防止匹配失败导致崩溃
+     if (ratio !== 'auto' && ratio !== 'free') {
+         const [rw, rh] = ratio.split(':').map(Number);
+-        if (rw > rh) { w = 16; h = Math.max(16 * (rh / rw), 6); } 
++        if (rw > rh) { w = 16; h = Math.max(16 * (rh / rw), 6); }
+         else if (rh > rw) { h = 16; w = Math.max(16 * (rw / rh), 6); }
+     }
+     return (
+@@ -29,7 +30,7 @@ const RatioIcon = ({ ratio, isActive }) => {
+  * 🚀 修复了高度塌陷和 Flex 间距问题，完美还原原版的精致布局
+  */
+ const ToolbarButton = ({ onClick, isActive, icon, label, extraData }) => (
+-    <button 
++    <button
+         onClick={onClick}
+         tabIndex={0}
+         // 强制写死 h-[38px] 防止被父级挤压
+@@ -48,36 +49,36 @@ const ToolbarButton = ({ onClick, isActive, icon, label, extraData }) => (
+     </button>
+ );
+ 
+-export default function ControlToolbar({ 
+-    mode, params, config, updateParam, 
+-    activePopover, setActivePopover, onSend, isLoading, isPromptEmpty
++export default function ControlToolbar({
++    mode, params, config, updateParam,
++    activePopover, setActivePopover, onSend, isLoading, isPromptEmpty, isSendBlocked = false
+ }) {
+-    
++
+     const isImageMode = mode === 'image';
+     const isAutoRatio = params.aspectRatio === 'auto';
+ 
+     // 模型选择逻辑
+-    const availableModels = isImageMode 
+-        ? IMAGE_MODELS 
++    const availableModels = isImageMode
++        ? IMAGE_MODELS
+         : getAvailableModelsByMode('video', params.videoRefMode);
+ 
+-    const currentModelLabel = isImageMode 
+-        ? IMAGE_MODELS.find(m => m.value === params.imageModel)?.label?.replace(' ✨NEW', '') 
++    const currentModelLabel = isImageMode
++        ? IMAGE_MODELS.find(m => m.value === params.imageModel)?.label?.replace(' ✨NEW', '')
+         : VIDEO_MODELS.find(m => m.value === params.videoModel)?.label;
+ 
+-    const isSendDisabled = isLoading || (isPromptEmpty && mode !== 'video');
++    const isSendDisabled = isLoading || isSendBlocked || (isPromptEmpty && mode !== 'video');
+ 
+     return (
+-        <div className="flex items-center justify-between px-1 relative">
+-            <div className="flex items-center gap-2 h-[38px]">
+-                
++        <div className="flex flex-wrap items-start justify-between gap-2 px-1 relative">
++            <div className="flex flex-wrap items-center gap-2 min-w-0">
++
+                 {/* 1. 模型选择 */}
+                 <Popover
+                     width="220px"
+                     isOpen={activePopover === 'model'}
+                     onClose={() => setActivePopover(null)}
+                     trigger={
+-                        <ToolbarButton 
++                        <ToolbarButton
+                             onClick={() => setActivePopover('model')}
+                             isActive={activePopover === 'model'}
+                             icon={isImageMode ? <Settings2 size={14} className="text-blue-400"/> : <Video size={14} className="text-purple-400"/>}
+@@ -87,8 +88,8 @@ export default function ControlToolbar({
+                 >
+                     <div className="p-1.5 flex flex-col">
+                         {availableModels.map(m => (
+-                            <button 
+-                                key={m.value} 
++                            <button
++                                key={m.value}
+                                 onClick={() => { updateParam(isImageMode ? 'imageModel' : 'videoModel', m.value); setActivePopover(null); }}
+                                 tabIndex={0}
+                                 className={`w-full text-left px-3 py-2.5 rounded-xl text-[13px] font-medium transition-colors flex items-center justify-between outline-none focus:bg-[#333] ${(isImageMode ? params.imageModel : params.videoModel) === m.value ? 'bg-blue-500/10 text-blue-400' : 'hover:bg-[#333] text-neutral-300'}`}
+@@ -106,7 +107,7 @@ export default function ControlToolbar({
+                     isOpen={activePopover === 'params'}
+                     onClose={() => setActivePopover(null)}
+                     trigger={
+-                        <ToolbarButton 
++                        <ToolbarButton
+                             onClick={() => setActivePopover('params')}
+                             isActive={activePopover === 'params'}
+                             // 💡 修复：完美恢复自适应图标和文字的判断逻辑
+@@ -138,7 +139,7 @@ export default function ControlToolbar({
+                             <>
+                                 <Section title="比例" grid items={config.ratios} current={params.aspectRatio} onSelect={(val) => updateParam('aspectRatio', val)} isRatio />
+                                 <Section title="清晰度" items={config.resolutions} current={params.resolution} onSelect={(val) => updateParam('resolution', val)} />
+-                                <Section title="生成时长" items={config.durations} current={params.duration} onSelect={(val) => updateParam('duration', val)} format={(v) => v === '-1' ? "自动" : `${v}s`} />
++                                <DurationControl durations={config.durations} current={params.duration} defaultDuration={config.defaultDuration} onSelect={(val) => updateParam('duration', val)} />
+                             </>
+                         )}
+                     </div>
+@@ -151,7 +152,7 @@ export default function ControlToolbar({
+                         isOpen={activePopover === 'preset'}
+                         onClose={() => setActivePopover(null)}
+                         trigger={
+-                            <ToolbarButton 
++                            <ToolbarButton
+                                 onClick={() => setActivePopover('preset')}
+                                 isActive={activePopover === 'preset'}
+                                 icon={<LayoutGrid size={14} className="text-pink-400"/>}
+@@ -169,9 +170,11 @@ export default function ControlToolbar({
+             </div>
+ 
+             {/* 发送按钮 */}
+-            <button 
++            <button
+                 onClick={onSend}
+                 disabled={isSendDisabled}
++                type="button"
++                aria-label={isLoading ? '正在生成' : '开始生成'}
+                 className={`w-[38px] h-[38px] shrink-0 rounded-full flex items-center justify-center transition-all shadow-md focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[#212121] outline-none
+                     ${isSendDisabled ? 'bg-neutral-700 text-neutral-500 cursor-not-allowed' : 'bg-white text-black hover:scale-105 active:scale-95 cursor-pointer'}`}>
+                 {isLoading ? <Loader2 size={18} className="animate-spin" /> : <ArrowUp size={18} strokeWidth={2.5} />}
+@@ -179,7 +182,7 @@ export default function ControlToolbar({
+ 
+             {/* 警告提示 */}
+             {config.warning && (
+-                <div className="absolute -bottom-8 left-0 w-full flex justify-center text-[11px] text-neutral-500 opacity-80 font-medium pointer-events-none">
++                <div className="basis-full flex justify-center text-[11px] text-neutral-500 opacity-80 font-medium pointer-events-none">
+                     <span className={`flex items-center gap-1.5 ${config.warning.color || ''}`}>
+                         {config.warning.icon === 'alert' ? <AlertTriangle size={12} className={config.warning.color ? "" : "text-amber-500/80"}/> : <Info size={12}/>}
+                         {config.warning.text}
+@@ -197,7 +200,7 @@ function Section({ title, items, current, onSelect, format, grid, isRatio, useVa
+     return (
+         <div className={grid ? "mb-4" : "mb-4 last:mb-0"}>
+             <div className="text-xs text-neutral-400 mb-2.5 font-medium">{title}</div>
+-            <div className={grid ? "grid grid-cols-6 gap-1.5" : "flex bg-[#1a1a1a] p-1 rounded-xl border border-white/5 gap-1"}>
++            <div className={grid ? "grid grid-cols-6 gap-1.5" : "flex flex-wrap bg-[#1a1a1a] p-1 rounded-xl border border-white/5 gap-1"}>
+                 {items.map(item => {
+                     const val = useValue ? item.value : item;
+                     const label = useValue ? item.label : (format ? format(item) : item);
+@@ -220,12 +223,51 @@ function Section({ title, items, current, onSelect, format, grid, isRatio, useVa
+ function RatioBtn({ icon, label, isActive, onClick, isFixed }) {
+     return (
+         <button onClick={onClick} tabIndex={0}
+-            className={`flex flex-col items-center justify-center rounded-xl border transition-all outline-none focus-visible:ring-2 focus-visible:ring-blue-500/50 
+-            ${isActive ? 'bg-[#333] border-neutral-500 text-white' : 'bg-[#1a1a1a] border-transparent text-neutral-500 hover:bg-[#2a2a2a]'} 
++            className={`flex flex-col items-center justify-center rounded-xl border transition-all outline-none focus-visible:ring-2 focus-visible:ring-blue-500/50
++            ${isActive ? 'bg-[#333] border-neutral-500 text-white' : 'bg-[#1a1a1a] border-transparent text-neutral-500 hover:bg-[#2a2a2a]'}
+             ${isFixed ? 'w-[72px] shrink-0' : 'py-1.5 w-full'}`}>
+             {/* 👆 如果 isFixed 为 true 则固定宽度 72px，否则用 w-full 完美填满 grid 单元格 */}
+             <div className={icon ? "mb-1.5" : "mb-0.5"}>{icon}</div>
+             <span className="text-[10px] font-medium">{label}</span>
+         </button>
+     );
+-}
+\ No newline at end of file
++}
++/** A bounded control driven by model options, rather than one button per second. */
++function DurationControl({ durations, current, defaultDuration, onSelect }) {
++    const sliderId = useId();
++    const values = getManualDurations(durations);
++    const isAuto = current === '-1';
++    const supportsAuto = durations.includes('-1');
++    const fallbackIndex = Math.max(0, values.indexOf(String(defaultDuration)));
++    const currentIndex = values.indexOf(String(current));
++    const sliderIndex = currentIndex >= 0 ? currentIndex : fallbackIndex;
++    const sliderValue = values[sliderIndex];
++
++    return (
++        <div>
++            <div className="flex items-center justify-between mb-2.5">
++                <label htmlFor={sliderId} className="text-xs text-neutral-400 font-medium">生成时长</label>
++                <output htmlFor={sliderId} className="text-xs text-neutral-200 tabular-nums">{isAuto ? '自动' : `${current}s`}</output>
++            </div>
++            <div className="flex items-center gap-3 rounded-xl border border-white/5 bg-[#1a1a1a] px-3 py-2.5">
++                {supportsAuto && (
++                    <button type="button" aria-pressed={isAuto} onClick={() => onSelect('-1')}
++                        className={`shrink-0 rounded-lg px-2.5 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${isAuto ? 'bg-[#333] text-white' : 'text-neutral-500 hover:text-neutral-300'}`}>
++                        自动
++                    </button>
++                )}
++                {values.length > 0 && (
++                    <div className="flex-1 min-w-0">
++                        <input id={sliderId} type="range" min="0" max={values.length - 1} step="1" value={sliderIndex}
++                            aria-valuetext={`${sliderValue}秒${isAuto ? '，拖动可指定时长' : ''}`}
++                            onChange={event => onSelect(values[Number(event.target.value)])}
++                            className="block w-full h-5 cursor-pointer accent-blue-500 focus-visible:outline-blue-500" />
++                        <div className="flex justify-between text-[10px] text-neutral-500 tabular-nums mt-1">
++                            <span>{values[0]}s</span><span>{values[values.length - 1]}s</span>
++                        </div>
++                    </div>
++                )}
++            </div>
++        </div>
++    );
++}
+diff --git a/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx b/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx
+index 848fff2..2a421cb 100644
+--- a/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx
++++ b/frontend/src/components/canvas/generation-panel/components/MentionTextarea.jsx
+@@ -3,11 +3,13 @@ import React, {
+     useRef,
+     forwardRef,
+     useImperativeHandle,
+-    useState
++    useState,
++    useCallback
+ } from 'react';
+ 
+ import {
+     useEditor,
++    useEditorState,
+     EditorContent,
+     ReactRenderer,
+     NodeViewWrapper,
+@@ -20,6 +22,10 @@ import tippy from 'tippy.js';
+ import 'tippy.js/dist/tippy.css';
+ 
+ import { LinkIcon, X } from 'lucide-react';
++import { getReferenceType, labelReferenceMedia } from '../../../../utils/referenceMedia.js';
++import { syncReferenceMentions } from '../utils/mentionDocument.js';
++
++const EMPTY_MEDIA = [];
+ 
+ // ==========================================
+ // 0. HTML 属性安全转义
+@@ -38,39 +44,7 @@ const escapeAttr = (value = '') => {
+ const parsePromptToHtml = (text, mediaList) => {
+     if (!text) return '';
+ 
+-    let imgCount = 0;
+-    let vidCount = 0;
+-    let audCount = 0;
+-
+-    const mediaMap = {};
+-
+-    mediaList.forEach((media) => {
+-        let prefix = '图';
+-        let num = 0;
+-
+-        if (
+-            media.type === 'video' ||
+-            media.type === 'video_media' ||
+-            media.type === 'video_node'
+-        ) {
+-            prefix = '视';
+-            num = ++vidCount;
+-        } else if (media.type === 'audio') {
+-            prefix = '音';
+-            num = ++audCount;
+-        } else {
+-            prefix = '图';
+-            num = ++imgCount;
+-        }
+-
+-        const label = `${prefix}${num}`;
+-
+-        mediaMap[label] = {
+-            id: media.id,
+-            src: media.src,
+-            type: media.type,
+-        };
+-    });
++    const mediaMap = new Map(labelReferenceMedia(mediaList).map(media => [media.displayLabel, media]));
+ 
+     let html = text
+         .replace(/&/g, '&amp;')
+@@ -79,7 +53,7 @@ const parsePromptToHtml = (text, mediaList) => {
+         .replace(/\n/g, '<br>');
+ 
+     html = html.replace(/@([图视音]\d+)/g, (match, label) => {
+-        const media = mediaMap[label];
++        const media = mediaMap.get(label);
+ 
+         if (!media) {
+             return match;
+@@ -94,41 +68,40 @@ const parsePromptToHtml = (text, mediaList) => {
+ // ==========================================
+ // 1. 下拉联想菜单组件
+ // ==========================================
+-const MentionList = forwardRef((props, ref) => {
+-    const [selectedIndex, setSelectedIndex] = useState(0);
+-
+-    useEffect(() => {
+-        setSelectedIndex(0);
+-    }, [props.items]);
++const MentionList = forwardRef(({ items, command }, ref) => {
++    const [selection, setSelection] = useState({ items: items, index: 0 });
++    const selectedIndex = selection.items === items ? selection.index : 0;
+ 
+-    const selectItem = (index) => {
+-        const item = props.items[index];
++    const selectItem = useCallback((index) => {
++        const item = items[index];
+ 
+         if (item) {
+-            props.command({
++            command({
+                 id: item.id,
+                 label: item.label,
+                 src: item.src,
+                 mediaType: item.type,
+             });
+         }
+-    };
++    }, [items, command]);
+ 
+     useImperativeHandle(ref, () => ({
+         onKeyDown: ({ event }) => {
+-            if (!props.items.length) return false;
++            if (!items.length) return false;
+ 
+             if (event.key === 'ArrowUp') {
+-                setSelectedIndex(prev =>
+-                    (prev + props.items.length - 1) % props.items.length
+-                );
++                setSelection({
++                    items: items,
++                    index: (selectedIndex + items.length - 1) % items.length,
++                });
+                 return true;
+             }
+ 
+             if (event.key === 'ArrowDown') {
+-                setSelectedIndex(prev =>
+-                    (prev + 1) % props.items.length
+-                );
++                setSelection({
++                    items: items,
++                    index: (selectedIndex + 1) % items.length,
++                });
+                 return true;
+             }
+ 
+@@ -139,9 +112,9 @@ const MentionList = forwardRef((props, ref) => {
+ 
+             return false;
+         },
+-    }), [props.items, selectedIndex]);
++    }), [items, selectedIndex, selectItem]);
+ 
+-    if (!props.items.length) return null;
++    if (!items.length) return null;
+ 
+     return (
+         <div className="z-[150] bg-[#2a2a2a] border border-[#444] rounded-xl shadow-[0_10px_40px_rgba(0,0,0,0.8)] overflow-hidden min-w-[180px]">
+@@ -150,7 +123,7 @@ const MentionList = forwardRef((props, ref) => {
+             </div>
+ 
+             <div className="max-h-[160px] overflow-y-auto no-wheel">
+-                {props.items.map((media, index) => (
++                {items.map((media, index) => (
+                     <button
+                         key={media.id || index}
+                         onClick={() => selectItem(index)}
+@@ -161,9 +134,7 @@ const MentionList = forwardRef((props, ref) => {
+                         }`}
+                     >
+                         {(
+-                            media.type === 'video' ||
+-                            media.type === 'video_media' ||
+-                            media.type === 'video_node'
++                            getReferenceType(media) === 'video'
+                         ) ? (
+                             <video
+                                 src={media.src}
+@@ -173,7 +144,7 @@ const MentionList = forwardRef((props, ref) => {
+                                 playsInline
+                                 crossOrigin="anonymous"
+                             />
+-                        ) : media.type === 'audio' ? (
++                        ) : getReferenceType(media) === 'audio' ? (
+                             <div className="w-6 h-6 rounded-md border border-black/50 flex items-center justify-center bg-neutral-800 text-[10px]">
+                                 🎵
+                             </div>
+@@ -208,16 +179,14 @@ const MentionNodeView = (props) => {
+         <NodeViewWrapper as="span" className="inline-block align-middle mx-1 select-none">
+             <span className="flex items-center gap-1.5 bg-[#171724] border border-[#2a2b44] rounded-[6px] p-1 shadow-sm transition-colors hover:border-[#3a3b54]">
+                 {(
+-                    mediaType === 'video' ||
+-                    mediaType === 'video_media' ||
+-                    mediaType === 'video_node'
++                    getReferenceType({ type: mediaType }) === 'video'
+                 ) ? (
+                     <video
+                         src={src}
+                         className="w-5 h-5 rounded-[4px] object-cover pointer-events-none"
+                         preload="metadata"
+                     />
+-                ) : mediaType === 'audio' ? (
++                ) : getReferenceType({ type: mediaType }) === 'audio' ? (
+                     <span className="w-5 h-5 rounded-[4px] bg-neutral-800 flex items-center justify-center text-[10px] pointer-events-none border border-black/30">
+                         🎵
+                     </span>
+@@ -295,13 +264,14 @@ const MentionTextarea = forwardRef(({
+     // 新增：父级拖拽排序后，递增这个 key，强制 TipTap 同步内容
+     forceSyncKey = 0,
+ }, ref) => {
+-    // 严谨 fallback：inputMedia 有内容则优先，否则使用 inputPictures
+-    const finalMedia = inputMedia?.length ? inputMedia : (inputPictures || []);
++    // An explicitly empty media list must clear stale legacy image references.
++    const finalMedia = inputMedia ?? inputPictures ?? EMPTY_MEDIA;
+ 
+     const latestProps = useRef({
+         finalMedia,
+         onSend,
+         prompt,
++        setPrompt,
+     });
+ 
+     useEffect(() => {
+@@ -309,8 +279,9 @@ const MentionTextarea = forwardRef(({
+             finalMedia,
+             onSend,
+             prompt,
++            setPrompt,
+         };
+-    }, [finalMedia, onSend, prompt]);
++    }, [finalMedia, onSend, prompt, setPrompt]);
+ 
+     const isMenuOpenRef = useRef(false);
+     const lastLoadedPromptRef = useRef(null);
+@@ -338,6 +309,8 @@ const MentionTextarea = forwardRef(({
+                 orderedList: false,
+             }),
+ 
++            // TipTap stores these callbacks and invokes them on editor events.
++            // eslint-disable-next-line react-hooks/refs
+             CustomMention.configure({
+                 suggestion: {
+                     allowedPrefixes: null,
+@@ -349,38 +322,9 @@ const MentionTextarea = forwardRef(({
+                             return [];
+                         }
+ 
+-                        let imgCount = 0;
+-                        let vidCount = 0;
+-                        let audCount = 0;
+-
+-                        return mediaList
+-                            .map((media) => {
+-                                let prefix = '图';
+-                                let num = 0;
+-
+-                                if (
+-                                    media.type === 'video' ||
+-                                    media.type === 'video_media' ||
+-                                    media.type === 'video_node'
+-                                ) {
+-                                    prefix = '视';
+-                                    num = ++vidCount;
+-                                } else if (media.type === 'audio') {
+-                                    prefix = '音';
+-                                    num = ++audCount;
+-                                } else {
+-                                    prefix = '图';
+-                                    num = ++imgCount;
+-                                }
+-
+-                                return {
+-                                    ...media,
+-                                    label: `${prefix}${num}`,
+-                                };
+-                            })
+-                            .filter(item =>
+-                                item.label.toLowerCase().includes(query.toLowerCase())
+-                            );
++                        return labelReferenceMedia(mediaList)
++                            .map(media => ({ ...media, label: media.displayLabel }))
++                            .filter(item => item.label.toLowerCase().includes(query.toLowerCase()));
+                     },
+ 
+                     render: () => {
+@@ -448,7 +392,7 @@ const MentionTextarea = forwardRef(({
+                 class: 'w-full text-[15px] leading-relaxed whitespace-pre-wrap break-all text-neutral-200 cursor-text',
+             },
+ 
+-            handleKeyDown: (view, event) => {
++            handleKeyDown: (_view, event) => {
+                 // 拦截中文输入法 IME，避免 Enter 误发送
+                 if (event.isComposing || event.keyCode === 229) {
+                     return false;
+@@ -473,157 +417,58 @@ const MentionTextarea = forwardRef(({
+ 
+             lastLoadedPromptRef.current = plainText;
+ 
+-            queueMicrotask(() => {
+-                if (editor.isDestroyed) return;
+-
+-                setPrompt(prev => {
+-                    return prev === plainText ? prev : plainText;
+-                });
+-            });
++            // Keep the parent's prompt ref current before a following Enter key
++            // can submit; deferring this write can reapply an older editor snapshot.
++            latestProps.current.setPrompt(plainText);
+         },
+     });
+ 
+-    // ==========================================
+-    // Hook A：父级 prompt / 媒体顺序变化后的内容重绘
+-    // ==========================================
++    // Prompt replacement and ID-based mention reconciliation share one transaction
++    // sequence. Cancel stale queued work when a newer prop snapshot arrives.
+     useEffect(() => {
+         if (!editor) return;
+-
+-        const isPromptChanged = lastLoadedPromptRef.current !== prompt;
+-        const isMediaChanged = lastParsedMediaSignatureRef.current !== currentMediaSignature;
+-        const shouldForceSync = lastForceSyncKeyRef.current !== forceSyncKey;
+-
+-        if (!isPromptChanged && !isMediaChanged && !shouldForceSync) {
+-            return;
+-        }
+-
+-        const htmlContent = parsePromptToHtml(prompt, finalMedia);
++        let cancelled = false;
+ 
+         queueMicrotask(() => {
+-            if (editor.isDestroyed) return;
+-
+-            /**
+-             * 普通外部更新：
+-             * - 编辑器 focus 时不要打断用户输入。
+-             *
+-             * 强制同步：
+-             * - 拖拽资产排序后，prompt 已经被父级重映射。
+-             * - 此时必须刷新 TipTap 内容，否则 UI 里还显示旧 @图N。
+-             */
+-            if (editor.isFocused && !shouldForceSync) {
+-                return;
++            if (cancelled || editor.isDestroyed) return;
++            const isPromptChanged = lastLoadedPromptRef.current !== prompt;
++            const isMediaChanged = lastParsedMediaSignatureRef.current !== currentMediaSignature;
++            const shouldForceSync = lastForceSyncKeyRef.current !== forceSyncKey;
++
++            if (!isPromptChanged && !isMediaChanged && !shouldForceSync) return;
++
++            if (isPromptChanged || shouldForceSync) {
++                const { from, to } = editor.state.selection;
++                editor.chain()
++                    .setContent(parsePromptToHtml(prompt, finalMedia), { emitUpdate: false })
++                    .command(({ tr }) => {
++                        tr.setMeta('addToHistory', false);
++                        return true;
++                    })
++                    .run();
++                if (editor.isFocused) {
++                    const maxPosition = editor.state.doc.content.size;
++                    editor.commands.setTextSelection({
++                        from: Math.min(from, maxPosition),
++                        to: Math.min(to, maxPosition),
++                    });
++                }
++                lastLoadedPromptRef.current = prompt;
+             }
+ 
+-            editor.commands.setContent(htmlContent, {
+-                emitUpdate: false,
+-            });
++            if (isMediaChanged) {
++                const transaction = syncReferenceMentions(editor.state.tr, finalMedia);
++                if (transaction.docChanged) {
++                    editor.view.dispatch(transaction.setMeta('addToHistory', false));
++                }
++            }
+ 
+-            lastLoadedPromptRef.current = prompt;
+             lastParsedMediaSignatureRef.current = currentMediaSignature;
+             lastForceSyncKeyRef.current = forceSyncKey;
+         });
+-    }, [
+-        prompt,
+-        finalMedia,
+-        editor,
+-        currentMediaSignature,
+-        forceSyncKey
+-    ]);
+-
+-    // ==========================================
+-    // Hook B：Mention 节点属性同步器
+-    // 响应资产 src/type/label 变化
+-    // ==========================================
+-    useEffect(() => {
+-        if (!editor) return;
+-
+-        queueMicrotask(() => {
+-            if (editor.isDestroyed) return;
+-
+-            const idToMediaMap = {};
+-
+-            let imgCount = 0;
+-            let vidCount = 0;
+-            let audCount = 0;
+-
+-            finalMedia.forEach((media) => {
+-                let prefix = '图';
+-                let num = 0;
+-
+-                if (
+-                    media.type === 'video' ||
+-                    media.type === 'video_media' ||
+-                    media.type === 'video_node'
+-                ) {
+-                    prefix = '视';
+-                    num = ++vidCount;
+-                } else if (media.type === 'audio') {
+-                    prefix = '音';
+-                    num = ++audCount;
+-                } else {
+-                    prefix = '图';
+-                    num = ++imgCount;
+-                }
+-
+-                idToMediaMap[media.id] = {
+-                    label: `${prefix}${num}`,
+-                    src: media.src,
+-                    mediaType: media.type,
+-                };
+-            });
+-
+-            const tr = editor.state.tr;
+-            let shouldDispatch = false;
+-
+-            editor.state.doc.descendants((node, pos) => {
+-                if (node.type.name !== 'mention') return;
+-
+-                const currentId = node.attrs.id;
+-                const correctMedia = idToMediaMap[currentId];
+-
+-                if (!correctMedia) {
+-                    shouldDispatch = true;
+-                    
+-                    // 删除失效 mention 节点，避免旧 @图N 误绑定到新的资产
+-                    tr.delete(pos, pos + node.nodeSize);
+-                    return; 
+-                }
+-
+-                const isLabelChanged = node.attrs.label !== correctMedia.label;
+-                const isSrcChanged = node.attrs.src !== correctMedia.src;
+-                const isTypeChanged = node.attrs.mediaType !== correctMedia.mediaType;
+ 
+-                if (isLabelChanged || isSrcChanged || isTypeChanged) {
+-                    shouldDispatch = true;
+-
+-                    tr.setNodeMarkup(pos, undefined, {
+-                        ...node.attrs,
+-                        label: correctMedia.label,
+-                        src: correctMedia.src,
+-                        mediaType: correctMedia.mediaType,
+-                    });
+-                }
+-            });
+-
+-            if (shouldDispatch) {
+-                editor.view.dispatch(
+-                    tr.setMeta('addToHistory', false)
+-                );
+-
+-                const newText = editor.getText();
+-                lastLoadedPromptRef.current = newText;
+-
+-                /**
+-                 * 这里不要 setPrompt(newText)。
+-                 * prompt 的语义重映射已经由 GenerationPanel 完成。
+-                 * 这里如果再次 setPrompt，容易在拖拽中产生竞态。
+-                 */
+-            }
+-        });
+-    }, [
+-        editor,
+-        currentMediaSignature
+-    ]);
++        return () => { cancelled = true; };
++    }, [prompt, finalMedia, editor, currentMediaSignature, forceSyncKey]);
+ 
+     // 向外暴露给 PictureTags 调用的插入方法
+     useImperativeHandle(ref, () => ({
+@@ -647,11 +492,16 @@ const MentionTextarea = forwardRef(({
+         },
+     }), [editor]);
+ 
++    const isEditorEmpty = useEditorState({
++        editor,
++        selector: ({ editor: currentEditor }) => currentEditor?.isEmpty ?? true,
++    });
++
+     if (!editor) return null;
+ 
+     return (
+-        <div className="px-1 mb-4 relative w-full border-none">
+-            {editor.isEmpty && (
++        <div className="px-1 mb-4 relative w-full min-h-0 border-none">
++            {isEditorEmpty && (
+                 <div className="absolute top-0 left-1 pointer-events-none text-neutral-500 text-[15px] leading-relaxed">
+                     {mode === 'image'
+                         ? '描述你想生成的画面 (输入 @ 引用资产)...'
+@@ -661,7 +511,7 @@ const MentionTextarea = forwardRef(({
+ 
+             <EditorContent
+                 editor={editor}
+-                className="no-wheel [&>.ProseMirror]:min-h-[48px] [&>.ProseMirror]:max-h-[500px] [&>.ProseMirror]:overflow-y-auto [&>.ProseMirror]:resize-y [&>.ProseMirror]:outline-none [&>.ProseMirror]:p-0"
++                className="no-wheel [&>.ProseMirror]:min-h-[48px] [&>.ProseMirror]:max-h-[min(180px,25dvh)] [&>.ProseMirror]:overflow-y-auto [&>.ProseMirror]:outline-none [&>.ProseMirror]:p-0"
+             />
+         </div>
+     );
+diff --git a/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx b/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx
+index 0282b48..6d71a88 100644
+--- a/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx
++++ b/frontend/src/components/canvas/generation-panel/components/PictureTags.jsx
+@@ -1,262 +1,176 @@
+-import React, { useState, useMemo, useEffect, useRef } from 'react';
++import React, { useMemo, useRef, useState } from 'react';
+ import { createPortal } from 'react-dom';
+-import { LinkIcon, X } from 'lucide-react';
+-import { MEDIA_TYPES } from '../../../../config/presets';
++import { ImageIcon, LinkIcon, Music2, Video, X } from 'lucide-react';
++import { getReferenceType, getReferenceSignature, labelReferenceMedia, reorderReferenceType } from '../../../../utils/referenceMedia';
++
++const EMPTY_MEDIA = [];
++const GROUPS = [
++    { type: 'image', title: '图片', Icon: ImageIcon },
++    { type: 'video', title: '视频', Icon: Video },
++    { type: 'audio', title: '音频', Icon: Music2 },
++];
+ 
+ export default function PictureTags({
+-    pictures,
++    pictures = EMPTY_MEDIA,
+     mode,
+     videoRefMode,
++    maxAssets,
+     onReorder,
+     onDelete,
+-    onInsert
++    onInsert,
+ }) {
+-    const [draggedIdx, setDraggedIdx] = useState(null);
+-
+-    // 拖拽过程中的本地预览顺序。
+-    // 注意：拖拽过程中不再直接通知父级，避免高频 updateNodeData / TipTap 重绘。
+-    const [draftPictures, setDraftPictures] = useState(pictures || []);
+-    const draftPicturesRef = useRef(pictures || []);
+-    const isDraggingRef = useRef(false);
+-
+-    const [hoveredAsset, setHoveredAsset] = useState(null);
+-    const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+-
+-    useEffect(() => {
+-        // 非拖拽状态下，父级数据变化时同步本地预览数据。
+-        // 拖拽中不覆盖本地顺序，否则会打断拖拽预览。
+-        if (!isDraggingRef.current) {
+-            setDraftPictures(pictures || []);
+-            draftPicturesRef.current = pictures || [];
+-        }
+-    }, [pictures]);
+-
+-    const picturesWithLabels = useMemo(() => {
+-        let imgCount = 0;
+-        let vidCount = 0;
+-        let audCount = 0;
+-
+-        return draftPictures.map(pic => {
+-            let tagPrefix = '图';
+-            let num = 0;
+-
+-            if ([MEDIA_TYPES.VIDEO, MEDIA_TYPES.VIDEO_MEDIA].includes(pic.type)) {
+-                tagPrefix = '视';
+-                num = ++vidCount;
+-            } else if (MEDIA_TYPES.AUDIO === pic.type) {
+-                tagPrefix = '音';
+-                num = ++audCount;
+-            } else {
+-                tagPrefix = '图';
+-                num = ++imgCount;
+-            }
+-
+-            return {
+-                ...pic,
+-                tagPrefix,
+-                displayLabel: `${tagPrefix}${num}`,
+-            };
+-        });
+-    }, [draftPictures]);
+-
+-    if (!pictures || pictures.length === 0) return null;
+-
+-    const commitReorder = () => {
+-        const nextList = draftPicturesRef.current || [];
+-
+-        const oldSignature = (pictures || []).map(item => item.id).join('|');
+-        const nextSignature = nextList.map(item => item.id).join('|');
+-
+-        // 顺序没变就不提交，避免无效重映射和无效保存。
+-        if (oldSignature !== nextSignature) {
+-            onReorder?.(nextList);
+-        }
++    // A draft belongs to one exact source snapshot. Incoming asset changes invalidate it,
++    // so a late drop cannot reintroduce a disconnected or externally reordered asset.
++    const [drag, setDrag] = useState(null);
++    const dragRef = useRef(null);
++    const [hover, setHover] = useState(null);
++    const sourceSignature = getReferenceSignature(pictures);
++    const currentDrag = drag?.source === sourceSignature ? drag : null;
++    const visiblePictures = currentDrag?.items || pictures;
++    const labeled = useMemo(() => labelReferenceMedia(visiblePictures), [visiblePictures]);
++    const hoveredAsset = hover?.source === sourceSignature ? hover.media : null;
++    const overLimit = maxAssets != null && labeled.length > maxAssets;
++
++    const clearDrag = () => {
++        dragRef.current = null;
++        setDrag(null);
+     };
+ 
+-    return (
+-        <>
+-            <div className="flex items-center gap-3 px-1 mb-4 pb-3 border-b border-white/5">
+-                <div className="w-10 h-10 rounded-xl border border-white/10 flex items-center justify-center text-neutral-400 bg-[#2a2a2a] shadow-inner shrink-0">
+-                    <LinkIcon size={18} />
+-                </div>
+-
+-                <div className="flex gap-2 overflow-x-auto p-1 items-center [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+-                    {picturesWithLabels.map((pic, i) => {
+-                        let rightBottomTag = null;
+-                        let showTopLeftTag = true;
+-
+-                        if (mode === 'video') {
+-                            if (videoRefMode === 'first_last') {
+-                                rightBottomTag = i === 0
+-                                    ? '首'
+-                                    : (i === picturesWithLabels.length - 1 ? '尾' : '参');
+-
+-                                showTopLeftTag = false;
+-                            } else {
+-                                showTopLeftTag = true;
+-                            }
+-                        }
+-
+-                        return (
+-                            <div
+-                                key={pic.id}
+-                                className="group relative w-11 h-11 shrink-0 cursor-pointer transition-transform"
+-                                draggable
+-                                onDragStart={(e) => {
+-                                    isDraggingRef.current = true;
+-                                    setDraggedIdx(i);
+-                                    setHoveredAsset(null);
+-
+-                                    // 以当前父级顺序作为拖拽起点。
+-                                    const startList = pictures || [];
+-                                    setDraftPictures(startList);
+-                                    draftPicturesRef.current = startList;
+-
+-                                    e.dataTransfer.effectAllowed = 'move';
+-                                    e.dataTransfer.setData('text/plain', '');
+-                                }}
+-                                onDragOver={(e) => {
+-                                    e.preventDefault();
+-
+-                                    if (draggedIdx === null || draggedIdx === i) {
+-                                        return;
+-                                    }
+-
+-                                    const currentList = draftPicturesRef.current || [];
+-                                    const newPictures = [...currentList];
+-
+-                                    const draggedItem = newPictures.splice(draggedIdx, 1)[0];
+-
+-                                    if (!draggedItem) return;
+-
+-                                    newPictures.splice(i, 0, draggedItem);
+-
+-                                    draftPicturesRef.current = newPictures;
+-                                    setDraftPictures(newPictures);
+-                                    setDraggedIdx(i);
++    const previewReorder = (event, target) => {
++        const active = dragRef.current;
++        if (!active || active.source !== sourceSignature || getReferenceType(target) !== active.type) return;
++        event.preventDefault();
++        event.dataTransfer.dropEffect = 'move';
++        const items = reorderReferenceType(active.items, active.id, target.id);
++        if (items === active.items) return;
++        const next = { ...active, items };
++        dragRef.current = next;
++        setDrag(next);
++    };
+ 
+-                                    // 注意：这里不再调用 onReorder。
+-                                    // 拖拽过程中只做本地视觉预览。
+-                                }}
+-                                onDragEnd={() => {
+-                                    commitReorder();
++    const commitDrop = (event, target) => {
++        const active = dragRef.current;
++        if (!active || active.source !== sourceSignature || getReferenceType(target) !== active.type) return;
++        event.preventDefault();
++        event.stopPropagation();
++        // Drag-over already produced the visible order; moving again here would
++        // invert adjacent drops and submit an order different from the preview.
++        const items = active.items;
++        clearDrag();
++        if (items.some((media, index) => media.id !== pictures[index]?.id)) onReorder?.(items);
++    };
+ 
+-                                    isDraggingRef.current = false;
+-                                    setDraggedIdx(null);
+-                                }}
+-                                onClick={() => onInsert?.(pic)}
+-                                onMouseEnter={(e) => {
+-                                    if (draggedIdx !== null) return;
++    const keyboardReorder = (event, media, group) => {
++        if (!event.altKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
++        event.preventDefault();
++        event.stopPropagation();
++        const direction = ['ArrowLeft', 'ArrowUp'].includes(event.key) ? -1 : 1;
++        const target = group[group.findIndex(item => item.id === media.id) + direction];
++        if (target) onReorder?.(reorderReferenceType(pictures, media.id, target.id));
++    };
+ 
+-                                    setHoveredAsset(pic);
+-                                    setMousePos({
+-                                        x: e.clientX,
+-                                        y: e.clientY,
+-                                    });
+-                                }}
+-                                onMouseMove={(e) => {
+-                                    setMousePos({
+-                                        x: e.clientX,
+-                                        y: e.clientY,
+-                                    });
+-                                }}
+-                                onMouseLeave={() => setHoveredAsset(null)}
+-                                style={{
+-                                    opacity: draggedIdx === i ? 0.4 : 1,
+-                                }}
+-                            >
+-                                <div className="w-full h-full rounded-xl overflow-hidden bg-black shadow-md border border-white/10 group-hover:ring-2 group-hover:ring-blue-500 transition-all relative">
+-                                    {([MEDIA_TYPES.VIDEO, MEDIA_TYPES.VIDEO_MEDIA].includes(pic.type)) ? (
+-                                        <video
+-                                            src={pic.src}
+-                                            className="w-full h-full object-cover pointer-events-none"
+-                                            preload="metadata"
+-                                            muted
+-                                            playsInline
+-                                            crossOrigin="anonymous"
+-                                        />
+-                                    ) : (MEDIA_TYPES.AUDIO === pic.type) ? (
+-                                        <div className="w-full h-full flex items-center justify-center bg-neutral-800 text-neutral-400 text-xs pointer-events-none">
+-                                            🎵
+-                                        </div>
+-                                    ) : (
+-                                        <img
+-                                            src={pic.src}
+-                                            className="w-full h-full object-cover pointer-events-none"
+-                                            crossOrigin="anonymous"
+-                                            alt={pic.displayLabel}
+-                                        />
+-                                    )}
++    const showPreview = (media, x, y) => {
++        if (dragRef.current?.source === sourceSignature) return;
++        setHover({ source: sourceSignature, media, x, y });
++    };
+ 
+-                                    {rightBottomTag && (
+-                                        <div className="absolute bottom-0 right-0 bg-black/80 text-white text-[8px] px-1.5 py-0.5 rounded-tl-md font-bold z-10 pointer-events-none">
+-                                            {rightBottomTag}
+-                                        </div>
+-                                    )}
++    if (labeled.length === 0) return null;
+ 
+-                                    {showTopLeftTag && (
+-                                        <div className="absolute top-0 left-0 bg-blue-500/90 backdrop-blur-sm text-white text-[9px] px-1.5 py-0.5 rounded-br-lg font-bold shadow-sm z-10 pointer-events-none">
+-                                            {pic.displayLabel}
+-                                        </div>
+-                                    )}
+-                                </div>
+-
+-                                <button
+-                                    onClick={(e) => {
+-                                        e.stopPropagation();
+-                                        onDelete?.(pic.id);
+-                                        setHoveredAsset(null);
+-                                    }}
+-                                    className="absolute -top-1.5 -right-1.5 w-[18px] h-[18px] bg-red-500 hover:bg-red-600 rounded-full flex items-center justify-center text-white opacity-0 group-hover:opacity-100 transition-all z-20 shadow-md scale-90 hover:scale-100"
+-                                >
+-                                    <X size={10} strokeWidth={3} />
+-                                </button>
+-                            </div>
+-                        );
+-                    })}
+-                </div>
++    return (
++        <div className="shrink-0 mb-3 border-b border-white/5 pb-3 min-h-0">
++            <div className="flex items-center justify-between gap-2 px-1 mb-2 text-xs">
++                <span className="flex items-center gap-1.5 text-neutral-400"><LinkIcon size={13} />参考资产</span>
++                <span className={overLimit ? 'text-amber-400 tabular-nums' : 'text-neutral-500 tabular-nums'}>
++                    {labeled.length}{maxAssets != null ? ` / ${maxAssets}` : ''} 项{overLimit ? ' · 已超出模型上限' : ''}
++                </span>
+             </div>
+-
+-            {hoveredAsset && createPortal(
+-                <div
+-                    className="fixed z-[9999] pointer-events-none animate-in fade-in zoom-in-95 duration-100"
+-                    style={{
+-                        left: mousePos.x,
+-                        top: mousePos.y - 15,
+-                        transform: 'translate(-50%, -100%)',
+-                    }}
+-                >
+-                    <div className="bg-[#1e1e1e]/95 backdrop-blur-md p-2 rounded-2xl border border-white/10 shadow-[0_20px_40px_rgba(0,0,0,0.6)] flex flex-col items-center">
+-                        {([MEDIA_TYPES.VIDEO, MEDIA_TYPES.VIDEO_MEDIA].includes(hoveredAsset.type)) ? (
+-                            <video
+-                                src={hoveredAsset.src}
+-                                autoPlay
+-                                loop
+-                                muted
+-                                className="max-w-[180px] max-h-[180px] rounded-xl object-contain bg-black/50 shadow-inner"
+-                            />
+-                        ) : (MEDIA_TYPES.AUDIO === hoveredAsset.type) ? (
+-                            <div className="w-[120px] h-[80px] flex items-center justify-center bg-neutral-900 rounded-xl text-3xl shadow-inner border border-black/30">
+-                                🎵
++            <div className="max-h-[min(300px,40dvh)] overflow-y-auto overscroll-contain px-1 pt-1 pb-2 space-y-3 [scrollbar-width:thin]"
++                aria-label="按类型分组的参考资产" onScroll={() => setHover(null)}>
++                {GROUPS.map(groupDefinition => {
++                    const { type, title, Icon } = groupDefinition;
++                    const group = labeled.filter(media => getReferenceType(media) === type);
++                    return (
++                        <section key={type} aria-label={`${title}引用`}>
++                            <div className="flex items-center gap-1.5 text-[11px] text-neutral-400 mb-2">
++                                <Icon size={12} /><span>{title}</span><span className="text-neutral-600 tabular-nums">{group.length}</span>
+                             </div>
+-                        ) : (
+-                            <img
+-                                src={hoveredAsset.src}
+-                                className="max-w-[180px] max-h-[180px] rounded-xl object-contain bg-black/50 shadow-inner"
+-                                alt=""
+-                            />
+-                        )}
+-
+-                        <div className="mt-2 text-[11px] font-bold text-blue-400 bg-blue-500/10 border border-blue-500/20 px-2 py-1 rounded-md">
+-                            {hoveredAsset.displayLabel}
+-                            <span className="text-neutral-400 font-normal ml-1">
+-                                · 点击插入到输入框
+-                            </span>
+-                        </div>
+-                    </div>
+-                </div>,
+-                document.body
+-            )}
+-        </>
++                            {group.length === 0 ? <p className="text-[11px] text-neutral-600 py-1">未连接{title}</p> : (
++                                <div className="grid grid-cols-[repeat(auto-fill,minmax(48px,1fr))] gap-2">
++                                    {group.map((media, index) => {
++                                        const firstLast = mode === 'video' && videoRefMode === 'first_last' && type === 'image';
++                                        const frameRole = firstLast ? (index === 0 ? '首' : index === group.length - 1 ? '尾' : '参') : null;
++                                        return (
++                                            <div key={media.id} data-reference-id={media.id} draggable
++                                                className={`group relative min-w-0 aspect-square ${currentDrag?.id === media.id ? 'opacity-40' : ''}`}
++                                                onDragStart={event => {
++                                                    const next = { source: sourceSignature, items: pictures, id: media.id, type };
++                                                    dragRef.current = next;
++                                                    setDrag(next);
++                                                    setHover(null);
++                                                    event.dataTransfer.effectAllowed = 'move';
++                                                    event.dataTransfer.setData('text/plain', String(media.id));
++                                                }}
++                                                onDragOver={event => previewReorder(event, media)}
++                                                onDrop={event => commitDrop(event, media)}
++                                                onDragEnd={clearDrag}>
++                                                <button type="button" draggable={false}
++                                                    className="relative w-full h-full overflow-hidden rounded-lg border border-white/10 bg-neutral-800 text-neutral-400 flex items-center justify-center outline-none hover:ring-2 hover:ring-blue-500 focus-visible:ring-2 focus-visible:ring-blue-500"
++                                                    aria-label={`引用${media.displayLabel}${frameRole ? `，${frameRole}帧` : ''}`}
++                                                    title="点击插入，Alt＋方向键排序"
++                                                    aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight Alt+ArrowUp Alt+ArrowDown"
++                                                    onKeyDown={event => keyboardReorder(event, media, group)}
++                                                    onClick={() => onInsert?.(media)}
++                                                    onMouseEnter={event => showPreview(media, event.clientX, event.clientY)}
++                                                    onMouseMove={event => showPreview(media, event.clientX, event.clientY)}
++                                                    onMouseLeave={() => setHover(null)}
++                                                    onFocus={event => {
++                                                        const rect = event.currentTarget.getBoundingClientRect();
++                                                        showPreview(media, rect.left + rect.width / 2, rect.top);
++                                                    }}
++                                                    onBlur={() => setHover(null)}>
++                                                    {type === 'image' ? (
++                                                        <img src={media.src} alt="" loading="lazy" decoding="async" draggable={false}
++                                                            className="w-full h-full object-cover pointer-events-none" />
++                                                    ) : <Icon size={22} className="pointer-events-none" />}
++                                                    <span className="absolute left-0 top-0 bg-black/75 text-white text-[9px] px-1 py-0.5 rounded-br-md pointer-events-none">{media.displayLabel}</span>
++                                                    {frameRole && <span className="absolute right-0 bottom-0 bg-black/80 text-white text-[9px] px-1.5 py-0.5 rounded-tl-md pointer-events-none">{frameRole}</span>}
++                                                </button>
++                                                <button type="button" draggable={false} aria-label={`移除${media.displayLabel}的连接`}
++                                                    onClick={event => { event.stopPropagation(); setHover(null); onDelete?.(media.id); }}
++                                                    className="absolute -top-1 -right-1 w-[18px] h-[18px] rounded-full bg-neutral-700 hover:bg-red-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-blue-500 outline-none transition-opacity">
++                                                    <X size={10} strokeWidth={3} />
++                                                </button>
++                                            </div>
++                                        );
++                                    })}
++                                </div>
++                            )}
++                        </section>
++                    );
++                })}
++            </div>
++            {hoveredAsset && createPortal(<AssetPreview media={hoveredAsset} x={hover.x} y={hover.y} />, document.body)}
++        </div>
++    );
++}
++
++function AssetPreview({ media, x, y }) {
++    const width = Math.max(0, Math.min(216, window.innerWidth - 16));
++    const height = Math.max(0, Math.min(236, window.innerHeight - 16));
++    const left = Math.max(8, Math.min(x - width / 2, window.innerWidth - width - 8));
++    const preferredTop = y - height - 12 >= 8 ? y - height - 12 : y + 16;
++    const top = Math.max(8, Math.min(preferredTop, window.innerHeight - height - 8));
++    const type = getReferenceType(media);
++    return (
++        <div className="fixed z-[9999] pointer-events-none rounded-xl border border-white/10 bg-[#1e1e1e]/95 p-2 shadow-2xl overflow-hidden"
++            style={{ left, top, width, maxHeight: height }}>
++            {type === 'video' ? (
++                <video key={media.id} src={media.src} autoPlay loop muted playsInline preload="metadata"
++                    className="w-full h-[176px] max-h-[24dvh] object-contain rounded-lg bg-black" />
++            ) : type === 'image' ? (
++                <img src={media.src} alt={media.displayLabel} className="w-full h-[176px] max-h-[24dvh] object-contain rounded-lg bg-black" />
++            ) : <div className="h-20 flex items-center justify-center bg-neutral-900 rounded-lg text-neutral-400"><Music2 size={32} /></div>}
++            <div className="mt-2 text-[11px] text-blue-400 truncate">{media.displayLabel}<span className="text-neutral-400 ml-1">· 点击插入，Alt＋方向键排序</span></div>
++        </div>
+     );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/components/canvas/generation-panel/hooks/useGenerationParams.js b/frontend/src/components/canvas/generation-panel/hooks/useGenerationParams.js
+index e8d378f..423d8ec 100644
+--- a/frontend/src/components/canvas/generation-panel/hooks/useGenerationParams.js
++++ b/frontend/src/components/canvas/generation-panel/hooks/useGenerationParams.js
+@@ -1,255 +1,127 @@
+ import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+-import {
+-    IMAGE_MODELS,
+-    VIDEO_MODELS,
+-    getModelConfig,
+-    getAvailableModelsByMode
+-} from '../../../../config/constants';
++import { getModelConfig } from '../../../../config/models';
++import { createGenerationParams, normalizeGenerationParams } from '../utils/generationParams';
+ 
+-const DEFAULT_IMAGE_MODEL = IMAGE_MODELS[0].value;
+-const DEFAULT_VIDEO_MODEL = VIDEO_MODELS[0].value;
++const PARAMETER_KEYS = [
++    'aspectRatio', 'imageSize', 'duration', 'resolution',
++    'gridMode', 'imageStyle', 'videoRefMode',
++];
++
++function serializeParams(params, mode) {
++    return {
++        model: mode === 'image' ? params.imageModel : params.videoModel,
++        ...Object.fromEntries(PARAMETER_KEYS.map(key => [key, params[key]])),
++    };
++}
++
++// Prompt, references and unrelated generation metadata must not reset local controls.
++function parameterSignature(generation, mode) {
++    return JSON.stringify({
++        model: generation.model,
++        ...Object.fromEntries(PARAMETER_KEYS.map(key => [key, generation[key]])),
++        mode,
++    });
++}
+ 
+ export function useGenerationParams(
+     anchorNode,
+     mode,
+     updateNodeData,
+     inputPicturesCount = 0,
+-    hasMediaInput = false
++    hasMediaInput = false,
++    persistGeneration
+ ) {
+-    const initVidMode = anchorNode.generation?.videoRefMode || 'first_last';
+-
+-    let initImgModel = mode === 'image' && anchorNode.generation?.model
+-        ? anchorNode.generation.model
+-        : DEFAULT_IMAGE_MODEL;
+-
+-    let initVidModel = mode === 'video' && anchorNode.generation?.model
+-        ? anchorNode.generation.model
+-        : DEFAULT_VIDEO_MODEL;
+-
+-    if (mode === 'video') {
+-        const availableInitModels = getAvailableModelsByMode('video', initVidMode);
+-        const isValid = availableInitModels.some(m => m.value === initVidModel);
+-
+-        if (!isValid && availableInitModels.length > 0) {
+-            initVidModel = availableInitModels[0].value;
+-        }
+-    }
+-
+-    const imgConfig = getModelConfig('image', initImgModel);
+-    const vidConfig = getModelConfig('video', initVidModel);
+-
+-    const [params, setParams] = useState({
+-        imageModel: initImgModel,
+-        videoModel: initVidModel,
+-        imageSize: anchorNode.generation?.imageSize || imgConfig.defaultSize,
+-        aspectRatio: anchorNode.generation?.aspectRatio || (
+-            mode === 'image' ? imgConfig.defaultRatio : vidConfig.defaultRatio
+-        ),
+-        duration: anchorNode.generation?.duration || vidConfig.defaultDuration,
+-        resolution: anchorNode.generation?.resolution || vidConfig.defaultResolution,
+-        gridMode: anchorNode.generation?.gridMode || 'standard',
+-        imageStyle: anchorNode.generation?.imageStyle || 'custom',
+-        videoRefMode: anchorNode.generation?.videoRefMode || 'first_last',
+-    });
+-
++    const [params, setParams] = useState(() => createGenerationParams(
++        anchorNode.generation || {}, mode, { inputPicturesCount, hasMediaInput }
++    ));
+     const stateRef = useRef(params);
+     const generationRef = useRef(anchorNode.generation || {});
+-
+-    useEffect(() => {
+-        stateRef.current = params;
+-    }, [params]);
++    const sourceSignature = parameterSignature(anchorNode.generation || {}, mode);
++    const observedSourceRef = useRef(sourceSignature);
+ 
+     useEffect(() => {
+         generationRef.current = anchorNode.generation || {};
+     }, [anchorNode.generation]);
+ 
+-    const currentModelId = mode === 'image'
+-        ? params.imageModel
+-        : params.videoModel;
++    const currentModelId = mode === 'image' ? params.imageModel : params.videoModel;
++    const config = useMemo(() => getModelConfig(mode, currentModelId), [mode, currentModelId]);
+ 
+-    const config = useMemo(() => {
+-        return getModelConfig(mode, currentModelId);
+-    }, [mode, currentModelId]);
+-    
+     const persistParamsToNode = useCallback((nextParams, overrides = {}) => {
+-        if (!updateNodeData) return;
+-
+-        const prevGeneration = generationRef.current || {};
+-        const currentModel = mode === 'image'
+-            ? nextParams.imageModel
+-            : nextParams.videoModel;
+-
+-        const nextGeneration = {
+-            ...prevGeneration,
+-
+-            model: currentModel,
+-            aspectRatio: nextParams.aspectRatio,
+-            imageSize: nextParams.imageSize,
+-            duration: nextParams.duration,
+-            resolution: nextParams.resolution,
+-            gridMode: nextParams.gridMode,
+-            imageStyle: nextParams.imageStyle,
+-            videoRefMode: nextParams.videoRefMode,
+-
+-            ...overrides,
+-        };
+-
+-        updateNodeData(anchorNode.id, {
+-            generation: nextGeneration,
+-        });
+-
++        const patch = { ...serializeParams(nextParams, mode), ...overrides };
++        if (persistGeneration) {
++            persistGeneration(patch);
++            return;
++        }
++        const nextGeneration = { ...generationRef.current, ...patch };
+         generationRef.current = nextGeneration;
+-    }, [
+-        anchorNode.id,
+-        mode,
+-        updateNodeData
+-    ]);
+-    const updateParam = useCallback((key, value) => {
+-        setParams(prev => {
+-            const next = {
+-                ...prev,
+-                [key]: value,
+-            };
+-
+-            if (key === 'imageModel' || key === 'videoModel') {
+-                const newConfig = getModelConfig(mode, value);
+-
+-                if (mode === 'image') {
+-                    if (!newConfig.sizes.includes(prev.imageSize)) {
+-                        next.imageSize = newConfig.defaultSize;
+-                    }
+-
+-                    if (!newConfig.ratios.includes(prev.aspectRatio)) {
+-                        next.aspectRatio = newConfig.defaultRatio;
+-                    }
+-                } else {
+-                    if (!newConfig.durations.includes(prev.duration)) {
+-                        next.duration = newConfig.defaultDuration;
+-                    }
++        updateNodeData?.(anchorNode.id, { generation: nextGeneration });
++    }, [anchorNode.id, mode, updateNodeData, persistGeneration]);
+ 
+-                    if (!newConfig.resolutions.includes(prev.resolution)) {
+-                        next.resolution = newConfig.defaultResolution;
+-                    }
++    const updateParam = useCallback((key, value) => {
++        const next = normalizeGenerationParams(
++            { ...stateRef.current, [key]: value },
++            mode,
++            { inputPicturesCount, hasMediaInput }
++        );
++        // Update the ref in the event, so rapid edits and immediate saves see the same values.
++        // Persistence is deliberately outside a React state updater (StrictMode can replay it).
++        stateRef.current = next;
++        setParams(next);
++        persistParamsToNode(next);
++        return next;
++    }, [mode, inputPicturesCount, hasMediaInput, persistParamsToNode]);
+ 
+-                    if (!newConfig.ratios.includes(prev.aspectRatio)) {
+-                        next.aspectRatio = newConfig.defaultRatio;
+-                    }
+-                }
++    useEffect(() => {
++        let cancelled = false;
++        queueMicrotask(() => {
++            if (cancelled) return;
++            const sourceChanged = observedSourceRef.current !== sourceSignature;
++            observedSourceRef.current = sourceSignature;
++            let source = stateRef.current;
++
++            // The node store is authoritative. A prior value can be an intentional
++            // undo/redo; value signatures are not persistence revision numbers.
++            if (sourceChanged) {
++                source = createGenerationParams(JSON.parse(sourceSignature), mode, {
++                    inputPicturesCount, hasMediaInput,
++                });
+             }
+ 
+-            if (key === 'videoRefMode' && mode === 'video') {
+-                const availableModels = getAvailableModelsByMode('video', value);
+-                const isCurrentModelValid = availableModels.some(m => m.value === prev.videoModel);
+-
+-                if (!isCurrentModelValid && availableModels.length > 0) {
+-                    next.videoModel = availableModels[0].value;
+-
+-                    const newConfig = getModelConfig('video', next.videoModel);
+-
+-                    if (!newConfig.durations.includes(prev.duration)) {
+-                        next.duration = newConfig.defaultDuration;
+-                    }
+-
+-                    if (!newConfig.resolutions.includes(prev.resolution)) {
+-                        next.resolution = newConfig.defaultResolution;
+-                    }
+-
+-                    if (!newConfig.ratios.includes(prev.aspectRatio)) {
+-                        next.aspectRatio = newConfig.defaultRatio;
+-                    }
+-                }
+-            }
+-            // 关键：参数修改后立即写回节点
+-            persistParamsToNode(next);
+-            return next;
++            const next = normalizeGenerationParams(source, mode, {
++                inputPicturesCount, hasMediaInput,
++            });
++            const nextSignature = parameterSignature(serializeParams(next, mode), mode);
++            const currentSignature = parameterSignature(serializeParams(stateRef.current, mode), mode);
++            if (nextSignature === currentSignature) return;
++
++            stateRef.current = next;
++            setParams(next);
++            // Reference constraints can force a supported mode. Store that correction
++            // without treating unrelated source metadata as a parameter change.
++            if (!sourceChanged) persistParamsToNode(next);
+         });
+-    }, [
+-        mode,
+-        persistParamsToNode
+-    ]);
++        return () => { cancelled = true; };
++    }, [sourceSignature, mode, inputPicturesCount, hasMediaInput, persistParamsToNode]);
+ 
+-    useEffect(() => {
+-        if (mode !== 'video') return;
+-
+-        const shouldForceMultiRef = inputPicturesCount >= 3 || hasMediaInput;
+-
+-        if (shouldForceMultiRef && params.videoRefMode !== 'multi_ref') {
+-            updateParam('videoRefMode', 'multi_ref');
+-        }
+-    }, [
+-        inputPicturesCount,
+-        hasMediaInput,
+-        mode,
+-        params.videoRefMode,
+-        updateParam
+-    ]);
++    const getParams = useCallback(() => stateRef.current, []);
+ 
+     const syncToNode = useCallback((overrides = {}) => {
+-        if (!updateNodeData) return;
+-
+-        const s = {
+-            ...stateRef.current,
+-            ...overrides,
+-        };
+-
+-        const prevGeneration = generationRef.current || {};
+-        const currentModel = mode === 'image' ? s.imageModel : s.videoModel;
+-
+-        const nextGeneration = {
+-            ...prevGeneration,
+-
+-            model: currentModel,
+-            aspectRatio: s.aspectRatio,
+-            imageSize: s.imageSize,
+-            duration: s.duration,
+-            resolution: s.resolution,
+-            gridMode: s.gridMode,
+-            imageStyle: s.imageStyle,
+-            videoRefMode: s.videoRefMode,
+-
+-            prompt: s.prompt !== undefined
+-                ? s.prompt
+-                : prevGeneration.prompt,
+-        };
+-
+-        // 关键：引用资产数据只有明确传入时才写。
+-        // 参数更新、关闭面板、普通 prompt 保存，不应该默认覆盖引用顺序。
+-        if (overrides.inputs !== undefined) {
+-            nextGeneration.inputs = overrides.inputs;
+-        }
+-
+-        if (overrides.referenceNodeIds !== undefined) {
+-            nextGeneration.referenceNodeIds = overrides.referenceNodeIds;
+-        }
+-
+-        if (overrides.rawPrompt !== undefined) {
+-            nextGeneration.rawPrompt = overrides.rawPrompt;
+-        }
+-
+-        if (overrides.finalPrompt !== undefined) {
+-            nextGeneration.finalPrompt = overrides.finalPrompt;
+-        }
+-
+-        if (overrides.apiMode !== undefined) {
+-            nextGeneration.apiMode = overrides.apiMode;
+-        }
+-
+-        updateNodeData(anchorNode.id, {
+-            generation: nextGeneration,
+-        });
+-
+-        // 关键：立即刷新 ref，避免下一次 syncToNode 又拿旧 generation。
+-        generationRef.current = nextGeneration;
+-    }, [
+-        anchorNode.id,
+-        mode,
+-        updateNodeData
+-    ]);
+-
+-    return {
+-        params,
+-        updateParam,
+-        syncToNode,
+-        config,
+-    };
+-}
+\ No newline at end of file
++        const next = normalizeGenerationParams(
++            { ...stateRef.current, ...overrides },
++            mode,
++            { inputPicturesCount, hasMediaInput }
++        );
++        stateRef.current = next;
++        setParams(next);
++        // Only explicitly supplied prompt/reference fields are written; parameter edits
++        // must never reset the asset order or the latest prompt.
++        const extraGeneration = Object.fromEntries(
++            ['prompt', 'inputs', 'referenceNodeIds', 'rawPrompt', 'finalPrompt', 'apiMode']
++                .filter(key => overrides[key] !== undefined)
++                .map(key => [key, overrides[key]])
++        );
++        persistParamsToNode(next, extraGeneration);
++    }, [mode, inputPicturesCount, hasMediaInput, persistParamsToNode]);
++
++    return { params, updateParam, syncToNode, getParams, config };
++}
+diff --git a/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js b/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js
+index a093aba..043c701 100644
+--- a/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js
++++ b/frontend/src/components/canvas/generation-panel/hooks/usePanelPosition.js
+@@ -1,35 +1,44 @@
+ import { useState, useLayoutEffect } from 'react';
++import { getPanelLayout } from '../utils/panelLayout.js';
+ 
+-export function usePanelPosition(anchorNode, viewport, depCount = 0) {
+-    const [panelStyle, setPanelStyle] = useState({ opacity: 0 });
++export function usePanelPosition(anchorNode, viewport, panelRef) {
++    const [style, setStyle] = useState({ opacity: 0, width: 520 });
++    const { x, y } = anchorNode.position;
++    const { w, h } = anchorNode.size;
++    const { zoom, x: panX, y: panY } = viewport;
+ 
+     useLayoutEffect(() => {
+-        if (!anchorNode) return;
+-        
+-        const nodeBottomScreenY = (anchorNode.position.y + anchorNode.size.h) * viewport.zoom + viewport.y;
+-        const nodeCenterScreenX = (anchorNode.position.x + anchorNode.size.w / 2) * viewport.zoom + viewport.x;
+-        
+-        const panelWidth = 520; // 根据组件 CSS 预设的定宽
+-        
+-        let top = nodeBottomScreenY + 16; 
+-        let left = nodeCenterScreenX - panelWidth / 2; 
+-        
+-        // 边缘碰撞检测
+-        if (left < 20) left = 20; 
+-        if (left + panelWidth > window.innerWidth - 20) left = window.innerWidth - panelWidth - 20;
+-        
+-        setPanelStyle({ 
+-            transform: `translate3d(${left}px, ${top}px, 0)`,
+-            opacity: 1,
+-            transition: 'opacity 0.15s ease-out' 
+-        }); 
+-        
+-    }, [
+-        anchorNode.position.x, anchorNode.position.y, 
+-        anchorNode.size.w, anchorNode.size.h, 
+-        viewport.zoom, viewport.x, viewport.y, 
+-        depCount // 依赖项变化时触发重计算
+-    ]);
+-
+-    return panelStyle;
+-}
+\ No newline at end of file
++        const panel = panelRef.current;
++        if (!panel) return;
++        const reposition = () => {
++            const parentRect = panel.offsetParent?.getBoundingClientRect() ?? { left: 0, top: 0 };
++            const layout = getPanelLayout({
++                anchor: {
++                    left: x * zoom + panX + parentRect.left,
++                    top: y * zoom + panY + parentRect.top,
++                    width: w * zoom,
++                    height: h * zoom,
++                },
++                viewportWidth: window.innerWidth,
++                viewportHeight: window.innerHeight,
++                panelHeight: panel.getBoundingClientRect().height,
++            });
++            const next = {
++                width: layout.width,
++                maxHeight: layout.maxHeight,
++                transform: `translate3d(${layout.left - parentRect.left}px, ${layout.top - parentRect.top}px, 0)`,
++                opacity: 1,
++            };
++            setStyle(previous => Object.keys(next).every(key => previous[key] === next[key]) ? previous : next);
++        };
++        reposition();
++        const observer = new ResizeObserver(reposition);
++        observer.observe(panel);
++        window.addEventListener('resize', reposition);
++        return () => {
++            observer.disconnect();
++            window.removeEventListener('resize', reposition);
++        };
++    }, [x, y, w, h, zoom, panX, panY, panelRef]);
++    return style;
++}
+diff --git a/frontend/src/components/canvas/generation-panel/utils/generationParams.js b/frontend/src/components/canvas/generation-panel/utils/generationParams.js
+new file mode 100644
+index 0000000..ab46b9b
+--- /dev/null
++++ b/frontend/src/components/canvas/generation-panel/utils/generationParams.js
+@@ -0,0 +1,69 @@
++import {
++    IMAGE_MODELS,
++    VIDEO_MODELS,
++    getAvailableModelsByMode,
++    getModelConfig,
++} from '../../../../config/models.js';
++
++const chooseOption = (options, value, fallback) => {
++    const normalized = value == null ? '' : String(value);
++    return options.includes(normalized) ? normalized : fallback;
++};
++
++/** Keep persisted and edited values inside the selected model's capabilities. */
++export function normalizeGenerationParams(params, mode, { inputPicturesCount = 0, hasMediaInput = false } = {}) {
++    const imageModel = IMAGE_MODELS.some(model => model.value === params.imageModel)
++        ? params.imageModel : IMAGE_MODELS[0].value;
++    let videoModel = VIDEO_MODELS.some(model => model.value === params.videoModel)
++        ? params.videoModel : VIDEO_MODELS[0].value;
++    let videoRefMode = params.videoRefMode || 'first_last';
++
++    if (mode === 'video') {
++        if (inputPicturesCount >= 3 || hasMediaInput) videoRefMode = 'multi_ref';
++        let available = getAvailableModelsByMode('video', videoRefMode);
++        if (available.length === 0) {
++            // Older nodes can retain a mode no longer offered by any provider.
++            const preferredModel = VIDEO_MODELS.find(model => model.value === videoModel);
++            videoRefMode = preferredModel.supportedModes?.[0] || 'first_last';
++            available = getAvailableModelsByMode('video', videoRefMode);
++        }
++        if (!available.some(model => model.value === videoModel)) videoModel = available[0].value;
++    }
++
++    const imageConfig = getModelConfig('image', imageModel);
++    const videoConfig = getModelConfig('video', videoModel);
++    const activeConfig = mode === 'image' ? imageConfig : videoConfig;
++    return {
++        ...params,
++        imageModel,
++        videoModel,
++        imageSize: chooseOption(imageConfig.sizes, params.imageSize, imageConfig.defaultSize),
++        aspectRatio: chooseOption(activeConfig.ratios, params.aspectRatio, activeConfig.defaultRatio),
++        duration: chooseOption(videoConfig.durations, params.duration, videoConfig.defaultDuration),
++        resolution: chooseOption(videoConfig.resolutions, params.resolution, videoConfig.defaultResolution),
++        gridMode: params.gridMode || 'standard',
++        imageStyle: params.imageStyle || 'custom',
++        videoRefMode,
++    };
++}
++
++export function createGenerationParams(generation, mode, referenceContext) {
++    return normalizeGenerationParams({
++        imageModel: mode === 'image' ? generation.model : undefined,
++        videoModel: mode === 'video' ? generation.model : undefined,
++        imageSize: generation.imageSize,
++        aspectRatio: generation.aspectRatio,
++        duration: generation.duration,
++        resolution: generation.resolution,
++        gridMode: generation.gridMode,
++        imageStyle: generation.imageStyle,
++        videoRefMode: generation.videoRefMode,
++    }, mode, referenceContext);
++}
++
++/** Slider positions represent allowed values, including models with gaps such as 5/10s. */
++export function getManualDurations(durations = []) {
++    return [...new Set(durations.map(String))]
++        .filter(value => Number.isFinite(Number(value)) && Number(value) > 0)
++        .sort((left, right) => Number(left) - Number(right));
++}
+diff --git a/frontend/src/components/canvas/generation-panel/utils/mentionDocument.js b/frontend/src/components/canvas/generation-panel/utils/mentionDocument.js
+new file mode 100644
+index 0000000..c113156
+--- /dev/null
++++ b/frontend/src/components/canvas/generation-panel/utils/mentionDocument.js
+@@ -0,0 +1,31 @@
++import { labelReferenceMedia } from '../../../../utils/referenceMedia.js';
++
++// Every position comes from the original document. Map it through earlier
++// deletions before applying the next change to the same transaction.
++export function syncReferenceMentions(transaction, mediaList) {
++    const mediaById = new Map(labelReferenceMedia(mediaList).map(media => [media.id, media]));
++    const document = transaction.doc;
++
++    document.descendants((node, position) => {
++        if (node.type.name !== 'mention') return;
++        const media = mediaById.get(node.attrs.id);
++        const from = transaction.mapping.map(position);
++
++        if (!media) {
++            transaction.delete(from, transaction.mapping.map(position + node.nodeSize));
++            return;
++        }
++
++        if (node.attrs.label !== media.displayLabel ||
++            node.attrs.src !== media.src || node.attrs.mediaType !== media.type) {
++            transaction.setNodeMarkup(from, undefined, {
++                ...node.attrs,
++                label: media.displayLabel,
++                src: media.src,
++                mediaType: media.type,
++            });
++        }
++    });
++
++    return transaction;
++}
+diff --git a/frontend/src/components/canvas/generation-panel/utils/mentionDocument.test.js b/frontend/src/components/canvas/generation-panel/utils/mentionDocument.test.js
+new file mode 100644
+index 0000000..896ea9b
+--- /dev/null
++++ b/frontend/src/components/canvas/generation-panel/utils/mentionDocument.test.js
+@@ -0,0 +1,62 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { Schema } from '@tiptap/pm/model';
++import { EditorState } from '@tiptap/pm/state';
++import { syncReferenceMentions } from './mentionDocument.js';
++
++const schema = new Schema({
++    nodes: {
++        doc: { content: 'paragraph+' },
++        paragraph: { content: 'inline*', group: 'block' },
++        text: { group: 'inline' },
++        mention: {
++            inline: true,
++            group: 'inline',
++            atom: true,
++            attrs: { id: {}, label: {}, src: {}, mediaType: {} },
++        },
++    },
++});
++const asset = (id, type = 'picture') => ({ id, type, src: `${id}.png` });
++const mention = (id, label, type = 'picture') => schema.node('mention', {
++    id, label, src: `${id}.png`, mediaType: type,
++});
++const state = (...children) => EditorState.create({
++    schema,
++    doc: schema.node('doc', null, [schema.node('paragraph', null, children)]),
++});
++const paragraphChildren = transaction => transaction.doc.firstChild.content.content.map(node => node.toJSON());
++
++test('removing several mentions in one transaction preserves intervening and trailing text', () => {
++    const initial = state(mention('a', '图1'), schema.text(' next '), mention('b', '图2'), schema.text(' end'));
++    const transaction = syncReferenceMentions(initial.tr, []);
++    assert.equal(transaction.doc.textContent, ' next  end');
++    assert.equal(transaction.steps.length, 2);
++    assert.equal(initial.doc.firstChild.childCount, 4);
++});
++
++test('deletions before a surviving mention map its relabel position correctly', () => {
++    const initial = state(mention('a', '图1'), schema.text(' / '), mention('b', '图2'), schema.text(' / '), mention('c', '图3'));
++    const transaction = syncReferenceMentions(initial.tr, [asset('c')]);
++    assert.deepEqual(paragraphChildren(transaction), [
++        { type: 'text', text: ' /  / ' },
++        mention('c', '图1').toJSON(),
++    ]);
++});
++
++test('mixed media reorder preserves reference identity and updates labels and source', () => {
++    const initial = state(mention('a', '图1'), mention('b', '图2'), mention('v', '视1', 'video_node'));
++    const transaction = syncReferenceMentions(initial.tr, [asset('b'), { ...asset('a'), src: 'updated.png' }, asset('v', 'video_node')]);
++    assert.deepEqual(paragraphChildren(transaction).map(node => ({ ...node.attrs })), [
++        { id: 'a', label: '图2', src: 'updated.png', mediaType: 'picture' },
++        { id: 'b', label: '图1', src: 'b.png', mediaType: 'picture' },
++        { id: 'v', label: '视1', src: 'v.png', mediaType: 'video_node' },
++    ]);
++});
++
++test('unchanged media does not create a history transaction', () => {
++    const initial = state(schema.text('keep '), mention('a', '图1'));
++    const transaction = syncReferenceMentions(initial.tr, [asset('a')]);
++    assert.equal(transaction.docChanged, false);
++    assert.equal(transaction.steps.length, 0);
++});
+diff --git a/frontend/src/components/canvas/generation-panel/utils/panelLayout.js b/frontend/src/components/canvas/generation-panel/utils/panelLayout.js
+new file mode 100644
+index 0000000..f28e1d7
+--- /dev/null
++++ b/frontend/src/components/canvas/generation-panel/utils/panelLayout.js
+@@ -0,0 +1,14 @@
++export function getPanelLayout({ anchor, viewportWidth, viewportHeight, panelHeight, preferredWidth = 520, margin = 16 }) {
++    const width = Math.min(preferredWidth, Math.max(1, viewportWidth - margin * 2));
++    const maxHeight = Math.max(1, viewportHeight - margin * 2);
++    const height = Math.min(panelHeight, maxHeight);
++    const below = anchor.top + anchor.height + margin;
++    const above = anchor.top - height - margin;
++    const desiredTop = below + height <= viewportHeight - margin ? below : above;
++    return {
++        width,
++        maxHeight,
++        left: Math.max(margin, Math.min(anchor.left + anchor.width / 2 - width / 2, viewportWidth - width - margin)),
++        top: Math.max(margin, Math.min(desiredTop, viewportHeight - height - margin)),
++    };
++}
+diff --git a/frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js b/frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js
+new file mode 100644
+index 0000000..04ff631
+--- /dev/null
++++ b/frontend/src/components/canvas/generation-panel/utils/panelLayout.test.js
+@@ -0,0 +1,24 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { getPanelLayout } from './panelLayout.js';
++
++const calculate = (overrides = {}) => getPanelLayout({
++    anchor: { left: 400, top: 100, width: 300, height: 100 },
++    viewportWidth: 1280, viewportHeight: 800, panelHeight: 300, ...overrides,
++});
++test('panel stays below node when it fits', () => assert.equal(calculate().top, 216));
++test('large asset region moves above a low node', () => {
++    const layout = calculate({ anchor: { left: 500, top: 650, width: 300, height: 100 }, panelHeight: 500 });
++    assert.equal(layout.top, 134);
++});
++test('small screens resize the panel and bound both axes', () => {
++    const layout = calculate({ viewportWidth: 360, viewportHeight: 480, panelHeight: 700 });
++    assert.deepEqual(layout, { width: 328, maxHeight: 448, left: 16, top: 16 });
++});
++test('offscreen nodes and viewport resizing never push the panel outside', () => {
++    for (const left of [-900, 3000]) {
++        const layout = calculate({ anchor: { left, top: -500, width: 300, height: 100 } });
++        assert.ok(layout.left >= 16 && layout.left + layout.width <= 1264);
++        assert.equal(layout.top, 16);
++    }
++});
+diff --git a/frontend/src/components/ui/Popover.jsx b/frontend/src/components/ui/Popover.jsx
+index 7093504..3425a43 100644
+--- a/frontend/src/components/ui/Popover.jsx
++++ b/frontend/src/components/ui/Popover.jsx
+@@ -1,84 +1,108 @@
+-import React, { useEffect, useRef } from 'react';
++import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
++import { createPortal } from 'react-dom';
++import { getPopoverPosition } from './popoverPosition.js';
+ 
+-/**
+- * 工业级 Popover 基础组件
+- * 包含：点击外部关闭、ESC 关闭、自动聚焦、基础进场动画
+- */
+-export default function Popover({ 
+-    isOpen, 
+-    onClose, 
+-    trigger, 
+-    children, 
+-    className = "",
+-    width = "auto"
++export default function Popover({
++    isOpen,
++    onClose,
++    trigger,
++    children,
++    className = '',
++    width = 'auto',
+ }) {
+     const popoverRef = useRef(null);
+     const triggerRef = useRef(null);
++    const onCloseRef = useRef(onClose);
++    const [position, setPosition] = useState(null);
+ 
+-    // 处理全局点击外部关闭 和 键盘 ESC 关闭
+-    useEffect(() => {
++    useLayoutEffect(() => {
++        onCloseRef.current = onClose;
++    }, [onClose]);
++
++    useLayoutEffect(() => {
+         if (!isOpen) return;
++        const popup = popoverRef.current;
++        const anchor = triggerRef.current;
+ 
+-        const handlePointerDown = (e) => {
+-            // 如果点击的不是触发按钮，也不是弹窗内部，就关闭
+-            if (
+-                popoverRef.current && !popoverRef.current.contains(e.target) &&
+-                triggerRef.current && !triggerRef.current.contains(e.target)
+-            ) {
+-                onClose();
+-            }
++        const reposition = () => {
++            const rect = popup.getBoundingClientRect();
++            const next = getPopoverPosition(
++                anchor.getBoundingClientRect(),
++                { width: rect.width, height: popup.scrollHeight + 2 },
++                { width: window.innerWidth, height: window.innerHeight },
++            );
++            setPosition(previous => (
++                previous && Object.keys(next).every(key => previous[key] === next[key])
++                    ? previous
++                    : next
++            ));
+         };
+ 
+-        const handleKeyDown = (e) => {
+-            if (e.key === 'Escape') {
+-                e.preventDefault();
+-                onClose();
+-                // 工业级细节：关闭弹窗后，把焦点还给触发它的按钮
+-                triggerRef.current?.focus(); 
+-            }
++        reposition();
++        const observer = new ResizeObserver(reposition);
++        observer.observe(anchor);
++        observer.observe(popup);
++        window.addEventListener('resize', reposition);
++        document.addEventListener('scroll', reposition, true);
++        return () => {
++            observer.disconnect();
++            window.removeEventListener('resize', reposition);
++            document.removeEventListener('scroll', reposition, true);
+         };
++    }, [isOpen, width]);
+ 
++    useEffect(() => {
++        if (!isOpen) return;
++        const handlePointerDown = event => {
++            if (!popoverRef.current?.contains(event.target) && !triggerRef.current?.contains(event.target)) {
++                onCloseRef.current();
++            }
++        };
++        const handleKeyDown = event => {
++            if (event.key === 'Escape') {
++                event.preventDefault();
++                onCloseRef.current();
++                triggerRef.current?.querySelector('button, [tabindex]')?.focus();
++            }
++        };
+         document.addEventListener('pointerdown', handlePointerDown, true);
+         document.addEventListener('keydown', handleKeyDown, true);
+-
++        const focusFrame = requestAnimationFrame(() => {
++            popoverRef.current?.querySelector(
++                'button:not(:disabled), [href], input:not(:disabled), select, textarea, [tabindex]:not([tabindex="-1"])',
++            )?.focus();
++        });
+         return () => {
++            cancelAnimationFrame(focusFrame);
+             document.removeEventListener('pointerdown', handlePointerDown, true);
+             document.removeEventListener('keydown', handleKeyDown, true);
+         };
+-    }, [isOpen, onClose]);
+-
+-    // 焦点劫持：弹窗打开时，自动聚焦到弹窗内的第一个可交互元素
+-    useEffect(() => {
+-        if (isOpen && popoverRef.current) {
+-            const focusableElements = popoverRef.current.querySelectorAll(
+-                'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+-            );
+-            if (focusableElements.length > 0) {
+-                // 延迟一帧聚焦，确保 DOM 已经完全渲染
+-                requestAnimationFrame(() => focusableElements[0].focus());
+-            }
+-        }
+     }, [isOpen]);
+ 
+     return (
+         <div className="relative inline-block">
+-            {/* 触发器插槽 */}
+-            <div ref={triggerRef} onClick={(e) => e.stopPropagation()}>
+-                {trigger}
+-            </div>
+-
+-            {/* 弹窗内容 */}
+-            {isOpen && (
+-                <div 
++            <div ref={triggerRef} onClick={event => event.stopPropagation()}>{trigger}</div>
++            {isOpen && createPortal(
++                <div
+                     ref={popoverRef}
+-                    className={`absolute z-[200] bottom-full left-0 mb-3 bg-[#242424] border border-[#333] rounded-2xl shadow-2xl animate-in fade-in zoom-in-95 duration-100 origin-bottom-left ${className}`}
+-                    style={{ width }}
+-                    // 阻止弹窗内的滚轮事件冒泡到画布底层
+-                    onWheel={(e) => e.stopPropagation()} 
++                    data-popover-placement={position?.placement}
++                    className={`fixed z-[200] overflow-y-auto overscroll-contain bg-[#242424] border border-[#333] rounded-2xl shadow-2xl ${className}`}
++                    style={{
++                        width,
++                        maxWidth: 'calc(100vw - 24px)',
++                        left: position?.left ?? 0,
++                        top: position?.top ?? 0,
++                        maxHeight: position?.maxHeight ?? 'calc(100vh - 24px)',
++                        visibility: position ? 'visible' : 'hidden',
++                    }}
++                    onPointerDown={event => event.stopPropagation()}
++                    onClick={event => event.stopPropagation()}
++                    onWheel={event => event.stopPropagation()}
+                 >
+                     {children}
+-                </div>
++                </div>,
++                document.body,
+             )}
+         </div>
+     );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/components/ui/popoverPosition.js b/frontend/src/components/ui/popoverPosition.js
+new file mode 100644
+index 0000000..6c72675
+--- /dev/null
++++ b/frontend/src/components/ui/popoverPosition.js
+@@ -0,0 +1,25 @@
++const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
++
++/** Keep floating controls inside the viewport, using the roomier side if needed. */
++export function getPopoverPosition(anchor, size, viewport, margin = 12, gap = 12) {
++    const availableWidth = Math.max(0, viewport.width - margin * 2);
++    const availableHeight = Math.max(0, viewport.height - margin * 2);
++    const width = Math.min(size.width, availableWidth);
++    const above = clamp(anchor.top - gap - margin, 0, availableHeight);
++    const below = clamp(viewport.height - anchor.bottom - gap - margin, 0, availableHeight);
++    const placement = size.height <= above || above >= below ? 'top' : 'bottom';
++    const maxHeight = placement === 'top' ? above : below;
++    const height = Math.min(size.height, maxHeight);
++
++    return {
++        left: clamp(anchor.left, margin, Math.max(margin, viewport.width - margin - width)),
++        top: clamp(
++            placement === 'top' ? anchor.top - gap - height : anchor.bottom + gap,
++            margin,
++            Math.max(margin, viewport.height - margin - height),
++        ),
++        width,
++        maxHeight,
++        placement,
++    };
++}
+diff --git a/frontend/src/components/ui/popoverPosition.test.mjs b/frontend/src/components/ui/popoverPosition.test.mjs
+new file mode 100644
+index 0000000..1c69519
+--- /dev/null
++++ b/frontend/src/components/ui/popoverPosition.test.mjs
+@@ -0,0 +1,44 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { getPopoverPosition } from './popoverPosition.js';
++
++test('opens above when there is room and clamps to the right viewport edge', () => {
++    const result = getPopoverPosition(
++        { top: 600, bottom: 638, left: 900 },
++        { width: 340, height: 300 },
++        { width: 1000, height: 800 },
++    );
++    assert.deepEqual(result, { left: 648, top: 288, width: 340, maxHeight: 576, placement: 'top' });
++});
++
++test('opens below a trigger near the top edge', () => {
++    const result = getPopoverPosition(
++        { top: 20, bottom: 58, left: 20 },
++        { width: 340, height: 300 },
++        { width: 1000, height: 800 },
++    );
++    assert.equal(result.placement, 'bottom');
++    assert.equal(result.top, 70);
++    assert.equal(result.maxHeight, 718);
++});
++
++test('oversized popup scrolls on the roomier side in a small viewport', () => {
++    const result = getPopoverPosition(
++        { top: 150, bottom: 188, left: 300 },
++        { width: 340, height: 600 },
++        { width: 320, height: 360 },
++    );
++    assert.deepEqual(result, { left: 12, top: 200, width: 296, maxHeight: 148, placement: 'bottom' });
++    assert.ok(result.top + result.maxHeight <= 348);
++});
++
++test('offscreen anchors never position the popup outside the viewport', () => {
++    for (const anchor of [
++        { top: -500, bottom: -462, left: -100 },
++        { top: 1500, bottom: 1538, left: 1200 },
++    ]) {
++        const result = getPopoverPosition(anchor, { width: 340, height: 300 }, { width: 800, height: 600 });
++        assert.ok(result.left >= 12 && result.left + result.width <= 788);
++        assert.ok(result.top >= 12 && result.top + Math.min(300, result.maxHeight) <= 588);
++    }
++});
+diff --git a/frontend/src/config/models.js b/frontend/src/config/models.js
+index c460fb4..cb03cfa 100644
+--- a/frontend/src/config/models.js
++++ b/frontend/src/config/models.js
+@@ -96,6 +96,7 @@ export const VIDEO_MODELS = [
+         supportedModes: ['multi_ref'],
+         config: {
+             ...BASE_VIDEO_CONFIG,
++            maxReferenceAssets: 50,
+             durations: ["-1", ...range(4, 30)],
+             defaultDuration: "15",
+             resolutions: ["480p", "720p", "1080p"],
+@@ -104,7 +105,7 @@ export const VIDEO_MODELS = [
+             defaultRatio: "16:9",
+             warning: {
+                 icon: 'info',
+-                text: '不支持真人参考.暂不支持视频参考'
++                text: '不支持真人参考'
+             }
+         }
+     },
+@@ -167,4 +168,4 @@ export const getAvailableModelsByMode = (mode, currentReferenceMode) => {
+     return models.filter(m => 
+         !m.supportedModes || m.supportedModes.includes(currentReferenceMode)
+     );
+-};
+\ No newline at end of file
++};
+diff --git a/frontend/src/services/aiGenerationService.js b/frontend/src/services/aiGenerationService.js
+index 3a8efd1..570ef7a 100644
+--- a/frontend/src/services/aiGenerationService.js
++++ b/frontend/src/services/aiGenerationService.js
+@@ -1,72 +1,9 @@
+ import { taskService } from './api';
+ import { IMAGE_MODELS, VIDEO_MODELS } from '../config/constants';
++import { createGenerationSubmitter } from './generationSubmission.js';
+ 
+-//const VALID_MEDIA_TYPES = ['picture', 'image', 'video', 'video_media', 'video_node', 'audio'];
+-const VALID_MEDIA_TYPES = ['picture', 'image'];
+-// 纯函数：不再依赖 React 环境的 state 和 hook
+-export const aiGenerationService = {
+-    async submitTask({ projectId, shareToken, genParams, canvasState, updateNodeStrictAndSave, pushHistory, showToast }) {
+-        const generatorNode = canvasState.nodes.find(n => n.id === genParams.nodeId);
+-        if (!generatorNode || generatorNode._isLoading) return;
+-        
+-        let inputs = genParams.inputs;
+-        // 🛡️ 兜底逻辑：如果面板没传，只抓取 "连入(to)" 的节点，严禁抓取 "连出(from)" 的节点
+-        if (!inputs || inputs.length === 0) {
+-            inputs = canvasState.edges
+-                .filter(e => e.to === generatorNode.id) // 👈 核心修复：只看入边
+-                .map(e => canvasState.nodes.find(n => n.id === e.from))
+-                .filter(Boolean)
+-                .filter(n => VALID_MEDIA_TYPES.includes(n.type))
+-                .map(n => {
+-                    let baseType = 'image';
+-                    if (n.type.includes('video')) baseType = 'video';
+-                    if (n.type.includes('audio')) baseType = 'audio';
+-                    return { url: n.src, type: baseType };
+-                })
+-                .filter(media => Boolean(media.url));
+-        }
+-
+-        //const BASE_URL = window.location.origin; 
+-        const BASE_URL = 'https://ai-other-01.oss-cn-hangzhou.aliyuncs.com'; 
+-        if (genParams.gridMode === 'four_grid' && genParams.aspectRatio === '9:16') {
+-            inputs.push({ url: `${BASE_URL}/templates/four_grid_9_16_template.png`, type: 'image' });
+-        } else if (genParams.gridMode === 'nine_grid' && genParams.aspectRatio === '9:16') {
+-            inputs.push({ url: `${BASE_URL}/templates/nine_grid_9_16_template.png`, type: 'image' });
+-        }
+-
+-        // 根据当前选中的 model，自动查出对应的 provider
+-        const allModels = generatorNode.type === 'video' ? VIDEO_MODELS : IMAGE_MODELS;
+-        const selectedModelInfo = allModels.find(m => m.value === genParams.model);
+-        const provider = selectedModelInfo ? selectedModelInfo.provider : 'zhenzhen'; // 找不到默认给 zhenzhen
+-
+-        pushHistory();
+-        updateNodeStrictAndSave(generatorNode.id, { _isLoading: true, generation: { ...genParams }, _error: null });
+-        
+-        try {
+-            const finalPayload = { 
+-                projectId, 
+-                nodeId: generatorNode.id, 
+-                ...genParams, 
+-                provider, 
+-                mode: genParams.apiMode, 
+-                inputs 
+-            };
+-
+-            const result = await (
+-                generatorNode.type === 'video' 
+-                ? taskService.createVideoTask(finalPayload, shareToken)
+-                : taskService.createImageTask(finalPayload, shareToken)
+-            );
+-                
+-            if (!result || !result.taskId) {
+-                console.error(`❌ [致命错误]: 后端返回成功，但找不到 taskId!`);
+-                showToast("创建任务失败：未拿到任务号");
+-                updateNodeStrictAndSave(generatorNode.id, { _isLoading: false, _error: "服务器未返回任务号" });
+-                return;
+-            }
+-            updateNodeStrictAndSave(generatorNode.id, { taskId: result.taskId });
+-        } catch (err) { 
+-            updateNodeStrictAndSave(generatorNode.id, { _isLoading: false, _error: err.message }); 
+-        }
+-    }
+-};
++export const aiGenerationService = createGenerationSubmitter({
++    taskService,
++    imageModels: IMAGE_MODELS,
++    videoModels: VIDEO_MODELS,
++});
+diff --git a/frontend/src/services/generationSubmission.js b/frontend/src/services/generationSubmission.js
+new file mode 100644
+index 0000000..45c072f
+--- /dev/null
++++ b/frontend/src/services/generationSubmission.js
+@@ -0,0 +1,105 @@
++import { getReferenceType } from '../utils/referenceMedia.js';
++
++const TEMPLATE_BASE_URL = 'https://ai-other-01.oss-cn-hangzhou.aliyuncs.com/templates';
++const GRID_TEMPLATES = {
++    four_grid: 'four_grid_9_16_template.png',
++    nine_grid: 'nine_grid_9_16_template.png',
++};
++
++/** Resolve only missing inputs; an explicit empty list means no references. */
++export function resolveGenerationInputs(genParams, canvasState, generatorNode) {
++    if (Array.isArray(genParams.inputs)) {
++        return genParams.inputs.map(input => ({ ...input }));
++    }
++
++    const nodesById = new Map(canvasState.nodes.map(node => [node.id, node]));
++    const connectedIds = [...new Set(canvasState.edges
++        .filter(edge => edge.to === generatorNode.id)
++        .map(edge => edge.from))];
++    const storedOrder = genParams.referenceNodeIds ?? generatorNode.generation?.referenceNodeIds;
++    const savedOrder = Array.isArray(storedOrder) ? storedOrder : [];
++    const orderedIds = [...new Set([...savedOrder, ...connectedIds])]
++        .filter(id => connectedIds.includes(id));
++
++    return orderedIds.flatMap(id => {
++        const node = nodesById.get(id);
++        const type = getReferenceType(node);
++        return type && node.src ? [{ id, url: node.src, type }] : [];
++    });
++}
++
++/** System templates belong to the request, never to editable node references. */
++export function buildGenerationRequestInputs(referenceInputs, genParams, nodeType) {
++    const inputs = referenceInputs.map(input => ({ ...input }));
++    const template = GRID_TEMPLATES[genParams.gridMode];
++
++    if (nodeType === 'image' && template && genParams.aspectRatio === '9:16') {
++        inputs.push({ url: `${TEMPLATE_BASE_URL}/${template}`, type: 'image' });
++    }
++
++    return inputs;
++}
++
++/** Keep task submission independent of React state and synchronous rendering. */
++export function createGenerationSubmitter({ taskService, imageModels, videoModels }) {
++    const submitting = new Set();
++
++    return {
++        async submitTask({ projectId, shareToken, genParams, canvasState, updateNodeStrictAndSave, pushHistory, showToast }) {
++            const generatorNode = canvasState.nodes.find(node => node.id === genParams.nodeId);
++            const submissionKey = JSON.stringify([projectId, genParams.nodeId]);
++
++            if (!generatorNode || generatorNode._isLoading || submitting.has(submissionKey)) return;
++            submitting.add(submissionKey);
++
++            try {
++                const referenceInputs = resolveGenerationInputs(genParams, canvasState, generatorNode);
++                const inputs = buildGenerationRequestInputs(referenceInputs, genParams, generatorNode.type);
++                const models = generatorNode.type === 'video' ? videoModels : imageModels;
++                const provider = models.find(model => model.value === genParams.model)?.provider ?? 'zhenzhen';
++                const editablePrompt = genParams.rawPrompt ?? genParams.prompt;
++
++                pushHistory();
++                updateNodeStrictAndSave(generatorNode.id, {
++                    _isLoading: true,
++                    generation: {
++                        ...generatorNode.generation,
++                        ...genParams,
++                        prompt: editablePrompt,
++                        rawPrompt: editablePrompt,
++                        finalPrompt: genParams.prompt,
++                        inputs: referenceInputs,
++                    },
++                    _error: null,
++                });
++
++                const finalPayload = {
++                    ...genParams,
++                    projectId,
++                    nodeId: generatorNode.id,
++                    provider,
++                    mode: genParams.apiMode,
++                    inputs,
++                };
++                const result = await (generatorNode.type === 'video'
++                    ? taskService.createVideoTask(finalPayload, shareToken)
++                    : taskService.createImageTask(finalPayload, shareToken));
++
++                if (!result?.taskId) {
++                    showToast?.('创建任务失败：未拿到任务号');
++                    updateNodeStrictAndSave(generatorNode.id, { _isLoading: false, _error: '服务器未返回任务号' });
++                    return;
++                }
++
++                updateNodeStrictAndSave(generatorNode.id, { taskId: result.taskId });
++            } catch (error) {
++                updateNodeStrictAndSave(generatorNode.id, {
++                    _isLoading: false,
++                    _error: error.message || '创建任务失败',
++                });
++            } finally {
++                submitting.delete(submissionKey);
++            }
++        },
++    };
++}
+diff --git a/frontend/src/services/generationSubmission.test.js b/frontend/src/services/generationSubmission.test.js
+new file mode 100644
+index 0000000..f6d264c
+--- /dev/null
++++ b/frontend/src/services/generationSubmission.test.js
+@@ -0,0 +1,154 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import {
++    buildGenerationRequestInputs,
++    createGenerationSubmitter,
++    resolveGenerationInputs,
++} from './generationSubmission.js';
++
++function fixture(overrides = {}) {
++    const generator = { id: 'generator', type: 'image', generation: { imageStyle: 'ue' } };
++    const calls = [];
++    const updates = [];
++    const options = {
++        projectId: 'project',
++        shareToken: 'share-token',
++        genParams: {
++            nodeId: generator.id,
++            model: 'image-model',
++            prompt: 'expanded prompt',
++            rawPrompt: 'editable @图1',
++            inputs: [{ id: 'picture', type: 'image', url: '/picture.png' }],
++            gridMode: 'four_grid',
++            aspectRatio: '9:16',
++        },
++        canvasState: { nodes: [generator], edges: [] },
++        updateNodeStrictAndSave: (id, data) => updates.push({ id, data }),
++        pushHistory: () => {},
++        showToast: () => {},
++        ...overrides,
++    };
++    const service = createGenerationSubmitter({
++        taskService: {
++            createImageTask: async (payload, token) => {
++                calls.push({ payload, token });
++                return { taskId: 'task-image' };
++            },
++            createVideoTask: async (payload, token) => {
++                calls.push({ payload, token });
++                return { taskId: 'task-video' };
++            },
++        },
++        imageModels: [{ value: 'image-model', provider: 'image-provider' }],
++        videoModels: [{ value: 'video-model', provider: 'video-provider' }],
++    });
++    return { generator, options, service, calls, updates };
++}
++
++test('grid templates are request-only and never mutate or accumulate in saved inputs', async () => {
++    const { options, service, calls, updates } = fixture();
++    Object.freeze(options.genParams.inputs[0]);
++    Object.freeze(options.genParams.inputs);
++    await service.submitTask(options);
++    await service.submitTask(options);
++
++    assert.equal(options.genParams.inputs.length, 1);
++    assert.deepEqual(calls.map(call => call.payload.inputs.length), [2, 2]);
++    assert.equal(calls[0].payload.provider, 'image-provider');
++    assert.equal(calls[0].token, 'share-token');
++    assert.equal(updates[0].data.generation.inputs.length, 1);
++    assert.equal(updates[0].data.generation.prompt, 'editable @图1');
++    assert.equal(updates[0].data.generation.finalPrompt, 'expanded prompt');
++    assert.equal(updates[0].data.generation.imageStyle, 'ue');
++    assert.equal(calls[0].payload.prompt, 'expanded prompt');
++});
++
++test('explicit empty inputs do not resurrect connected assets', () => {
++    const { options, generator } = fixture();
++    const state = {
++        nodes: [generator, { id: 'picture', type: 'picture', src: '/picture.png' }],
++        edges: [{ from: 'picture', to: generator.id }],
++    };
++    assert.deepEqual(resolveGenerationInputs({ ...options.genParams, inputs: [] }, state, generator), []);
++});
++
++test('fallback preserves saved ordering, all media types, and only incoming edges', () => {
++    const generator = { id: 'generator', generation: { referenceNodeIds: ['audio', 'video', 'picture', 'disconnected'] } };
++    const nodes = [generator,
++        { id: 'picture', type: 'picture', src: '/picture.png' },
++        { id: 'video', type: 'video_node', src: '/video.mp4' },
++        { id: 'audio', type: 'audio', src: '/audio.mp3' },
++        { id: 'output', type: 'image', src: '/output.png' },
++        { id: 'text', type: 'text', src: '/text.txt' },
++    ];
++    const edges = [
++        { from: 'picture', to: generator.id },
++        { from: 'video', to: generator.id },
++        { from: 'audio', to: generator.id },
++        { from: 'audio', to: generator.id },
++        { from: 'text', to: generator.id },
++        { from: generator.id, to: 'output' },
++    ];
++    assert.deepEqual(resolveGenerationInputs({}, { nodes, edges }, generator), [
++        { id: 'audio', type: 'audio', url: '/audio.mp3' },
++        { id: 'video', type: 'video', url: '/video.mp4' },
++        { id: 'picture', type: 'image', url: '/picture.png' },
++    ]);
++});
++
++test('video tasks do not inherit image grid templates', async () => {
++    const { options, generator, calls, service } = fixture();
++    generator.type = 'video';
++    options.genParams.model = 'video-model';
++    await service.submitTask(options);
++    assert.equal(calls[0].payload.inputs.length, 1);
++    assert.equal(calls[0].payload.provider, 'video-provider');
++});
++
++test('concurrent requests for the same project and node are locked until submission finishes', async () => {
++    const { options, updates } = fixture();
++    let complete;
++    let requests = 0;
++    const service = createGenerationSubmitter({
++        taskService: {
++            createImageTask: () => {
++                requests++;
++                return new Promise(resolve => { complete = resolve; });
++            },
++        },
++        imageModels: [], videoModels: [],
++    });
++
++    const first = service.submitTask(options);
++    await service.submitTask(options);
++    assert.equal(requests, 1);
++    complete({ taskId: 'task' });
++    await first;
++    assert.equal(updates.at(-1).data.taskId, 'task');
++});
++
++test('failed submissions clear loading and release the submission lock for a retry', async () => {
++    const { options, updates } = fixture();
++    let attempts = 0;
++    const service = createGenerationSubmitter({
++        taskService: {
++            createImageTask: async () => {
++                if (attempts++ === 0) throw new Error('network failed');
++                return { taskId: 'retry-task' };
++            },
++        },
++        imageModels: [], videoModels: [],
++    });
++    await service.submitTask(options);
++    assert.deepEqual(updates.at(-1).data, { _isLoading: false, _error: 'network failed' });
++    await service.submitTask(options);
++    assert.equal(attempts, 2);
++    assert.equal(updates.at(-1).data.taskId, 'retry-task');
++});
++
++test('template input copies also isolate the individual input objects', () => {
++    const original = [{ type: 'image', url: '/reference.png' }];
++    const request = buildGenerationRequestInputs(original, { gridMode: 'standard' }, 'image');
++    request[0].url = '/changed.png';
++    assert.equal(original[0].url, '/reference.png');
++});
+diff --git a/frontend/src/utils/referenceMedia.js b/frontend/src/utils/referenceMedia.js
+new file mode 100644
+index 0000000..3bb037b
+--- /dev/null
++++ b/frontend/src/utils/referenceMedia.js
+@@ -0,0 +1,90 @@
++const REFERENCE_TYPES = {
++    picture: 'image', image: 'image',
++    video: 'video', video_media: 'video', video_node: 'video',
++    audio: 'audio',
++};
++const PREFIXES = { image: '图', video: '视', audio: '音' };
++
++export function getReferenceType(media) {
++    return REFERENCE_TYPES[media?.type] ?? null;
++}
++
++export function labelReferenceMedia(mediaList) {
++    const counts = { image: 0, video: 0, audio: 0 };
++    return mediaList.filter(media => getReferenceType(media)).map(media => {
++        const type = getReferenceType(media);
++        return { ...media, tagPrefix: PREFIXES[type], displayLabel: `${PREFIXES[type]}${++counts[type]}` };
++    });
++}
++
++// Preserve saved order; deduplicate edges and append newly connected assets.
++export function reconcileReferenceOrder(mediaList, orderIds = []) {
++    const byId = new Map(mediaList.filter(media => getReferenceType(media)).map(media => [media.id, media]));
++    const ids = [...new Set([...orderIds, ...byId.keys()])];
++    return ids.filter(id => byId.has(id)).map(id => byId.get(id));
++}
++
++export function serializeReferenceMedia(mediaList) {
++    return mediaList.filter(media => getReferenceType(media) && media.src).map(media => ({
++        id: media.id, url: media.src, type: getReferenceType(media),
++    }));
++}
++
++// Saved inputs retain type/identity even if an edge was removed while the panel
++// was closed. Use that snapshot to resolve old @ labels before renumbering.
++export function restoreReferenceMedia(generation, currentMedia) {
++    const saved = generation?.inputs;
++    if (!Array.isArray(saved) || !saved.some(input => input.id != null)) return currentMedia;
++    const byId = new Map(currentMedia.map(media => [media.id, media]));
++    for (const input of saved) {
++        if (input.id != null && getReferenceType(input)) {
++            byId.set(input.id, { id: input.id, type: input.type, src: input.url });
++        }
++    }
++    const order = generation.referenceNodeIds ?? saved.map(input => input.id);
++    return order.map(id => byId.get(id)).filter(Boolean);
++}
++
++// Map the whole token in one pass so @图1 never corrupts @图10 or swaps twice.
++export function remapReferencePrompt(prompt, previous, next) {
++    const previousByLabel = new Map(labelReferenceMedia(previous).map(media => [media.displayLabel, media.id]));
++    const nextById = new Map(labelReferenceMedia(next).map(media => [media.id, media.displayLabel]));
++    return prompt.replace(/@([图视音]\d+)/g, (token, label) => {
++        const id = previousByLabel.get(label);
++        if (id === undefined) return token;
++        const nextLabel = nextById.get(id);
++        return nextLabel ? `@${nextLabel}` : '';
++    });
++}
++
++// Reordering within a type must not change the order of other media types.
++export function reorderReferenceType(mediaList, draggedId, targetId) {
++    const dragged = mediaList.find(media => media.id === draggedId);
++    const type = getReferenceType(dragged);
++    const group = mediaList.filter(media => getReferenceType(media) === type);
++    const from = group.findIndex(media => media.id === draggedId);
++    const to = group.findIndex(media => media.id === targetId);
++    if (!type || from < 0 || to < 0 || from === to) return mediaList;
++    group.splice(to, 0, group.splice(from, 1)[0]);
++    let index = 0;
++    return mediaList.map(media => getReferenceType(media) === type ? group[index++] : media);
++}
++
++export function getReferenceSignature(mediaList) {
++    return JSON.stringify(mediaList.map(({ id, type, src }) => [id, type, src]));
++}
++
++export function getReferenceValidationError(mediaList, mode, config = {}) {
++    if (mediaList.some(media => !media.src)) return '有引用资产尚未生成或上传完成，请完成后再生成。';
++    const types = mediaList.map(getReferenceType);
++    if (mode === 'image' && types.some(type => type !== 'image')) {
++        return '当前图片模型仅支持图片参考，请断开视频和音频引用。';
++    }
++    if (config.maxReferenceAssets && mediaList.length > config.maxReferenceAssets) {
++        return `当前模型最多支持 ${config.maxReferenceAssets} 个引用资产，已连接 ${mediaList.length} 个。`;
++    }
++    if (mode === 'video' && types.includes('audio') && !types.some(type => type === 'image' || type === 'video')) {
++        return '音频参考需要至少一张图片或一个视频作为画面参考。';
++    }
++    return null;
++}
+diff --git a/frontend/src/utils/referenceMedia.test.js b/frontend/src/utils/referenceMedia.test.js
+new file mode 100644
+index 0000000..a088fad
+--- /dev/null
++++ b/frontend/src/utils/referenceMedia.test.js
+@@ -0,0 +1,51 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { labelReferenceMedia, reconcileReferenceOrder, remapReferencePrompt, reorderReferenceType, serializeReferenceMedia, restoreReferenceMedia, getReferenceValidationError } from './referenceMedia.js';
++
++const media = (id, type = 'image') => ({ id, type, src: `/${id}` });
++
++test('all reference aliases share numbering across UI and payload', () => {
++    const list = [media('a'), media('b', 'video_node'), media('c', 'audio'), media('d', 'video_media'), media('e', 'picture')];
++    assert.deepEqual(labelReferenceMedia(list).map(m => m.displayLabel), ['图1', '视1', '音1', '视2', '图2']);
++    assert.deepEqual(serializeReferenceMedia(list).map(m => m.type), ['image', 'video', 'audio', 'video', 'image']);
++});
++
++test('saved order survives reopen, duplicate edges, removal and reconnection', () => {
++    const list = [media('a'), media('b'), media('a'), media('v', 'video'), media('text', 'text')];
++    assert.deepEqual(reconcileReferenceOrder(list, ['b', 'missing', 'a']).map(m => m.id), ['b', 'a', 'v']);
++    assert.deepEqual(reconcileReferenceOrder([media('a'), media('b')], ['b']).map(m => m.id), ['b', 'a']);
++});
++
++test('deleting or externally disconnecting references preserves IDs in prompt', () => {
++    const previous = [media('a'), media('v', 'video'), media('b'), media('c')];
++    assert.equal(remapReferencePrompt('@图1 @图2 @图3 @视1', previous, [previous[1], previous[3], previous[2]]), ' @图2 @图1 @视1');
++});
++
++test('50 references remap full tokens without prefix collisions', () => {
++    const list = Array.from({ length: 50 }, (_, i) => media(String(i)));
++    const reversed = [...list].reverse();
++    assert.equal(remapReferencePrompt('@图1 @图10 @图50 @图99', list, reversed), '@图50 @图41 @图1 @图99');
++    assert.equal(serializeReferenceMedia(list).length, 50);
++});
++
++test('typed reorder leaves other media slots and numbering intact', () => {
++    const list = [media('a'), media('v', 'video'), media('b'), media('audio', 'audio')];
++    const next = reorderReferenceType(list, 'a', 'b');
++    assert.deepEqual(next.map(m => m.id), ['b', 'v', 'a', 'audio']);
++    assert.equal(reorderReferenceType(list, 'a', 'v'), list);
++});
++
++test('closed-panel disconnection remaps using the saved reference identity', () => {
++    const previous = [media('a'), media('b'), media('c')];
++    const generation = { inputs: serializeReferenceMedia(previous), referenceNodeIds: ['a', 'b', 'c'] };
++    const current = [media('b'), media('c')];
++    assert.equal(remapReferencePrompt('@图1 @图2 @图3', restoreReferenceMedia(generation, current), current), ' @图1 @图2');
++});
++
++test('submission validates missing URLs, incompatible media, combined limit and audio-only inputs', () => {
++    assert.match(getReferenceValidationError([{ id: 'a', type: 'image' }], 'video'), /尚未生成/);
++    assert.match(getReferenceValidationError([media('v', 'video')], 'image'), /仅支持图片参考/);
++    assert.match(getReferenceValidationError(Array.from({ length: 51 }, (_, index) => media(index)), 'video', { maxReferenceAssets: 50 }), /已连接 51/);
++    assert.match(getReferenceValidationError([media('a', 'audio')], 'video'), /画面参考/);
++    assert.equal(getReferenceValidationError([media('a', 'audio'), media('v', 'video')], 'video'), null);
++});
+diff --git a/frontend/tests/browser/generation-panel.spec.js b/frontend/tests/browser/generation-panel.spec.js
+new file mode 100644
+index 0000000..2fa67e2
+--- /dev/null
++++ b/frontend/tests/browser/generation-panel.spec.js
+@@ -0,0 +1,154 @@
++import { test, expect } from '@playwright/test';
++
++const fixture = '/tests/fixtures/generation-panel.html';
++const state = async page => JSON.parse(await page.getByTestId('saved-state').textContent());
++const submissions = async page => JSON.parse(await page.getByTestId('submissions').textContent());
++const panel = page => page.locator('[data-panel-for]');
++const editor = page => page.locator('.ProseMirror');
++
++test.beforeEach(async ({ page }) => {
++    page.runtimeErrors = [];
++    page.on('pageerror', error => page.runtimeErrors.push(error.message));
++});
++test.afterEach(async ({ page }) => {
++    expect(page.runtimeErrors).toEqual([]);
++});
++
++async function expectWithinViewport(locator, page) {
++    const box = await locator.boundingBox();
++    const viewport = page.viewportSize();
++    expect(box.x).toBeGreaterThanOrEqual(0);
++    expect(box.y).toBeGreaterThanOrEqual(0);
++    expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
++    expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
++}
++
++test('50 mixed assets have three regions, full saved inputs and reachable final asset', async ({ page }) => {
++    await page.goto(fixture);
++    await expect(page.getByRole('region', { name: '图片引用' })).toBeVisible();
++    await expect(page.getByRole('region', { name: '视频引用' })).toBeVisible();
++    await expect(page.getByRole('region', { name: '音频引用' })).toBeVisible();
++    await expect(page.locator('[data-reference-id]')).toHaveCount(50);
++    await page.getByRole('button', { name: '引用音5', exact: true }).scrollIntoViewIfNeeded();
++    await expect(page.getByRole('button', { name: '引用音5', exact: true })).toBeInViewport();
++    await expectWithinViewport(panel(page), page);
++    expect((await state(page)).generation.inputs).toHaveLength(50);
++    await page.screenshot({ path: 'test-results/generation-panel-50-assets.png' });
++});
++
++test('small viewport keeps panel and duration popup inside the window', async ({ page }) => {
++    await page.setViewportSize({ width: 360, height: 640 });
++    await page.goto(fixture);
++    await expectWithinViewport(panel(page), page);
++    await page.getByRole('button', { name: /720p/ }).click();
++    const popup = page.locator('[data-popover-placement]');
++    await expect(popup).toBeVisible();
++    await expectWithinViewport(popup, page);
++    await expect(page.getByRole('slider', { name: '生成时长' })).toBeVisible();
++    await page.screenshot({ path: 'test-results/generation-panel-mobile-duration.png' });
++});
++
++test('duration slider accepts 30s, auto and valid model switching', async ({ page }) => {
++    await page.goto(`${fixture}?count=0`);
++    await page.getByRole('button', { name: /720p/ }).click();
++    const slider = page.getByRole('slider', { name: '生成时长' });
++    await slider.focus();
++    await page.keyboard.press('Home');
++    await expect.poll(async () => (await state(page)).generation.duration).toBe('4');
++    await page.keyboard.press('End');
++    await expect.poll(async () => (await state(page)).generation.duration).toBe('30');
++    await page.getByRole('button', { name: '自动', exact: true }).click();
++    await expect.poll(async () => (await state(page)).generation.duration).toBe('-1');
++    await slider.focus();
++    await page.keyboard.press('End');
++    await page.keyboard.press('Escape');
++    await page.getByRole('button', { name: /即梦 2.5/ }).click();
++    await page.getByRole('button', { name: '即梦 2.0 (zhenzhen)', exact: true }).click();
++    await expect.poll(async () => (await state(page)).generation.duration).toBe('15');
++});
++
++test('external disconnect remaps mentions and reconnection shows removed asset again', async ({ page }) => {
++    await page.goto(`${fixture}?count=3&mixed=false&prompt=${encodeURIComponent('@图1 @图2 @图3')}`);
++    await expect(editor(page)).toContainText('图3');
++    await page.getByRole('button', { name: '外部断开第一项' }).click();
++    await expect.poll(async () => (await state(page)).generation.prompt).toBe(' @图1 @图2');
++    await expect(page.locator('[data-reference-id]')).toHaveCount(2);
++    await page.getByRole('button', { name: '重新连接第一项' }).click();
++    await expect(page.locator('[data-reference-id]')).toHaveCount(3);
++    await expect.poll(async () => (await state(page)).generation.referenceNodeIds).toEqual(['asset-1', 'asset-2', 'asset-0']);
++});
++
++test('disconnect while closed uses saved identities when reopening', async ({ page }) => {
++    await page.goto(`${fixture}?count=3&mixed=false&prompt=${encodeURIComponent('@图2')}`);
++    await expect(editor(page)).toContainText('图2');
++    await page.getByRole('button', { name: '关闭面板' }).click();
++    await page.getByRole('button', { name: '外部断开第一项' }).click();
++    await page.getByRole('button', { name: '打开面板' }).click();
++    await expect.poll(async () => (await state(page)).generation.prompt).toBe('@图1');
++    await expect(editor(page)).toContainText('图1');
++});
++
++test('keyboard sorting changes numbering while preserving referenced identity', async ({ page }) => {
++    await page.goto(`${fixture}?count=3&mixed=false&prompt=${encodeURIComponent('@图1')}`);
++    await page.getByRole('button', { name: '引用图1', exact: true }).focus();
++    await page.keyboard.press('Alt+ArrowRight');
++    await expect.poll(async () => (await state(page)).generation.referenceNodeIds).toEqual(['asset-1', 'asset-0', 'asset-2']);
++    await expect.poll(async () => (await state(page)).generation.prompt).toBe('@图2');
++    await editor(page).press('Control+z');
++    await expect.poll(async () => (await state(page)).generation.prompt).toBe('@图2');
++});
++
++test('drag drop commits its preview and cancelling a drag preserves saved order', async ({ page }) => {
++    await page.goto(`${fixture}?count=3&mixed=false&prompt=${encodeURIComponent('@图1')}`);
++    await page.locator('[data-reference-id="asset-0"]').dragTo(page.locator('[data-reference-id="asset-1"]'));
++    await expect.poll(async () => (await state(page)).generation.referenceNodeIds).toEqual(['asset-1', 'asset-0', 'asset-2']);
++    const transfer = await page.evaluateHandle(() => new DataTransfer());
++    await page.locator('[data-reference-id="asset-1"]').dispatchEvent('dragstart', { dataTransfer: transfer });
++    await page.locator('[data-reference-id="asset-2"]').dispatchEvent('dragover', { dataTransfer: transfer });
++    await page.locator('[data-reference-id="asset-1"]').dispatchEvent('dragend', { dataTransfer: transfer });
++    expect((await state(page)).generation.referenceNodeIds).toEqual(['asset-1', 'asset-0', 'asset-2']);
++    await page.locator('[data-reference-id="asset-1"]').dispatchEvent('dragstart', { dataTransfer: transfer });
++    await page.locator('[data-reference-id="asset-2"]').dispatchEvent('dragover', { dataTransfer: transfer });
++    await page.getByRole('button', { name: '外部更新时长' }).click();
++    await page.locator('[data-reference-id="asset-2"]').dispatchEvent('drop', { dataTransfer: transfer });
++    await expect.poll(async () => (await state(page)).generation.referenceNodeIds).toEqual(['asset-0', 'asset-2', 'asset-1']);
++    await transfer.dispose();
++});
++
++test('external text and reference order are adopted as a single snapshot', async ({ page }) => {
++    await page.goto(`${fixture}?count=3&mixed=false&prompt=${encodeURIComponent('@图1')}`);
++    await expect(editor(page)).toContainText('图1');
++    await page.getByRole('button', { name: '外部同时更新文本和顺序' }).click();
++    await expect.poll(async () => (await state(page)).generation.prompt).toBe('来自协作的新文字 @图3');
++    await expect(editor(page)).toContainText('来自协作的新文字');
++    expect((await state(page)).generation.referenceNodeIds).toEqual(['asset-2', 'asset-1', 'asset-0']);
++});
++
++test('typing then immediately submitting uses the latest prompt and blocks Enter while loading', async ({ page }) => {
++    await page.goto(`${fixture}?count=0&prompt=`);
++    await editor(page).fill('最新文本');
++    await editor(page).press('Enter');
++    await expect.poll(async () => (await submissions(page)).length).toBe(1);
++    expect((await submissions(page))[0].rawPrompt).toBe('最新文本');
++    await page.getByRole('button', { name: '模拟生成中' }).click();
++    await editor(page).press('Enter');
++    expect((await submissions(page)).length).toBe(1);
++});
++
++test('over-limit and unready inputs are visible and block submission', async ({ page }) => {
++    await page.goto(`${fixture}?count=51`);
++    await expect(page.getByRole('alert')).toContainText('最多支持 50');
++    await expect(page.getByRole('button', { name: '开始生成' })).toBeDisabled();
++    await page.goto(`${fixture}?count=3&mixed=false&unready=true`);
++    await expect(page.getByRole('alert')).toContainText('尚未生成或上传完成');
++    await editor(page).press('Enter');
++    expect(await submissions(page)).toHaveLength(0);
++});
++
++test('remote parameters hydrate the open panel and loaded prompt has no placeholder overlay', async ({ page }) => {
++    await page.goto(`${fixture}?count=0&prompt=${encodeURIComponent('已保存的内容')}`);
++    await expect(editor(page)).toHaveText('已保存的内容');
++    await expect(page.getByText('描述你想生成的视频内容 (输入 @ 引用资产)...', { exact: true })).toHaveCount(0);
++    await page.getByRole('button', { name: '外部更新时长' }).click();
++    await expect(page.getByRole('button', { name: /720p.*8s/ })).toBeVisible();
++});
+diff --git a/frontend/tests/fixtures/generation-panel.html b/frontend/tests/fixtures/generation-panel.html
+new file mode 100644
+index 0000000..dc1a723
+--- /dev/null
++++ b/frontend/tests/fixtures/generation-panel.html
+@@ -0,0 +1 @@
++<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body style="margin:0;background:#121212"><div id="root"></div><script type="module" src="./generation-panel.jsx"></script></body></html>
+diff --git a/frontend/tests/fixtures/generation-panel.jsx b/frontend/tests/fixtures/generation-panel.jsx
+new file mode 100644
+index 0000000..19e45b8
+--- /dev/null
++++ b/frontend/tests/fixtures/generation-panel.jsx
+@@ -0,0 +1,61 @@
++import { StrictMode, useCallback, useState } from 'react';
++import { createRoot } from 'react-dom/client';
++import GenerationPanel from '../../src/components/canvas/generation-panel/GenerationPanel';
++import '../../src/assets/index.css';
++
++const query = new URLSearchParams(window.location.search);
++const mode = query.get('mode') || 'video';
++const count = Number(query.get('count') ?? 50);
++const mixed = query.get('mixed') !== 'false';
++const svg = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"><rect width="80" height="80" fill="#364e70"/><circle cx="40" cy="38" r="20" fill="#6b9ac4"/></svg>')}`;
++const assets = Array.from({ length: count }, (_, index) => ({
++    id: `asset-${index}`,
++    type: !mixed || index < 35 ? 'picture' : index < 45 ? 'video_node' : 'audio',
++    src: query.has('unready') && index === 0 ? undefined : svg,
++}));
++
++export default function Fixture() {
++    const [incoming, setIncoming] = useState(assets);
++    const [open, setOpen] = useState(true);
++    const [submissions, setSubmissions] = useState([]);
++    const [anchor, setAnchor] = useState({
++        id: 'generator', type: mode, position: { x: 460, y: 420 }, size: { w: 280, h: 180 },
++        generation: {
++            model: mode === 'video' ? 'doubao-seedance-2.5' : 'nano-banana-2',
++            prompt: query.get('prompt') ?? (count ? '参考 @图1 与 @图2' : '电影场景'),
++            duration: '30', aspectRatio: '16:9', resolution: '720p', videoRefMode: 'multi_ref',
++            inputs: assets.map(asset => ({ id: asset.id, type: asset.type === 'picture' ? 'image' : asset.type === 'video_node' ? 'video' : 'audio', url: asset.src })),
++            referenceNodeIds: assets.map(asset => asset.id),
++        },
++    });
++    const updateNodeData = useCallback((_id, patch) => setAnchor(previous => ({
++        ...previous, ...patch, generation: { ...previous.generation, ...patch.generation },
++    })), []);
++    const removeConnection = useCallback(id => setIncoming(previous => previous.filter(asset => asset.id !== id)), []);
++    const generate = useCallback(payload => setSubmissions(previous => [...previous, payload]), []);
++    return (
++        <main className="relative w-screen h-screen text-white">
++            <div className="fixed top-0 left-0 z-0 flex flex-wrap gap-2 p-1 text-xs" data-fixture-controls>
++                <button onClick={() => setOpen(value => !value)}>{open ? '关闭面板' : '打开面板'}</button>
++                <button onClick={() => removeConnection('asset-0')}>外部断开第一项</button>
++                <button onClick={() => setIncoming(previous => previous.some(asset => asset.id === 'asset-0') ? previous : [...previous, assets[0]])}>重新连接第一项</button>
++                <button onClick={() => updateNodeData('generator', { generation: { duration: '8', model: 'doubao-seedance-2.5' } })}>外部更新时长</button>
++                <button onClick={() => updateNodeData('generator', { _isLoading: true })}>模拟生成中</button>
++                <button onClick={() => updateNodeData('generator', { generation: {
++                    prompt: '来自协作的新文字 @图3',
++                    referenceNodeIds: [...assets].reverse().map(asset => asset.id),
++                    inputs: [...assets].reverse().map(asset => ({ id: asset.id, type: asset.type === 'picture' ? 'image' : asset.type === 'video_node' ? 'video' : 'audio', url: asset.src })),
++                } })}>外部同时更新文本和顺序</button>
++            </div>
++            {open && <GenerationPanel
++                key={anchor.id} mode={mode} anchorNode={anchor} incomingNodes={incoming.map(asset => ({ ...asset }))}
++                viewport={{ x: 0, y: 0, zoom: 1 }} updateNodeData={updateNodeData}
++                onRemoveConnection={removeConnection} onGenerate={generate}
++            />}
++            <pre hidden data-testid="saved-state">{JSON.stringify(anchor)}</pre>
++            <pre hidden data-testid="submissions">{JSON.stringify(submissions)}</pre>
++        </main>
++    );
++}
++
++createRoot(document.getElementById('root')).render(<StrictMode><Fixture /></StrictMode>);
+diff --git a/frontend/tests/generationParams.test.mjs b/frontend/tests/generationParams.test.mjs
+new file mode 100644
+index 0000000..896bfff
+--- /dev/null
++++ b/frontend/tests/generationParams.test.mjs
+@@ -0,0 +1,51 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createGenerationParams, normalizeGenerationParams, getManualDurations } from '../src/components/canvas/generation-panel/utils/generationParams.js';
++
++const SEEDANCE_25 = 'doubao-seedance-2.5';
++const SEEDANCE_20 = 'zhenzhen-doubao-seedance-2-0-260128';
++
++test('new and legacy video nodes always have a mode with selectable models', () => {
++    for (const generation of [{}, { model: SEEDANCE_25, videoRefMode: 'first_last' }]) {
++        const params = createGenerationParams(generation, 'video');
++        assert.equal(params.videoRefMode, 'multi_ref');
++        assert.equal(params.duration, '15');
++        assert.equal(params.aspectRatio, '16:9');
++    }
++});
++
++test('model changes reset incompatible values and preserve compatible ones', () => {
++    const original = createGenerationParams({ model: SEEDANCE_25, duration: '30', resolution: '1080p', aspectRatio: '9:16' }, 'video');
++    const next = normalizeGenerationParams({ ...original, videoModel: SEEDANCE_20 }, 'video');
++    assert.equal(next.duration, '15');
++    assert.equal(next.resolution, '1080p');
++    assert.equal(next.aspectRatio, '9:16');
++});
++
++test('saved values are normalized before rendering or sending', () => {
++    const params = createGenerationParams({ model: SEEDANCE_20, duration: 30, resolution: '4K', aspectRatio: 'invalid' }, 'video');
++    assert.equal(params.duration, '15');
++    assert.equal(params.resolution, '720p');
++    assert.equal(params.aspectRatio, '16:9');
++    const numeric = createGenerationParams({ model: SEEDANCE_25, duration: 30 }, 'video');
++    assert.equal(numeric.duration, '30');
++});
++
++test('automatic duration survives normalization and reference changes', () => {
++    const params = createGenerationParams({ model: SEEDANCE_25, duration: '-1' }, 'video', { inputPicturesCount: 50 });
++    assert.equal(params.duration, '-1');
++    assert.equal(params.videoRefMode, 'multi_ref');
++});
++
++test('unknown saved model and unsupported image settings recover to actual defaults', () => {
++    const params = createGenerationParams({ model: 'removed-model', imageSize: '8K', aspectRatio: 'bad' }, 'image');
++    assert.equal(params.imageModel, 'nano-banana-2');
++    assert.equal(params.imageSize, '2K');
++    assert.equal(params.aspectRatio, 'auto');
++});
++
++test('duration slider exposes only configured manual values, even for sparse models', () => {
++    assert.deepEqual(getManualDurations(['-1', '10', '5', '5', 15, 'NaN', '0']), ['5', '10', '15']);
++    assert.deepEqual(getManualDurations(['-1']), []);
++    assert.deepEqual(getManualDurations(), []);
++});
+-- 
+2.51.1
+

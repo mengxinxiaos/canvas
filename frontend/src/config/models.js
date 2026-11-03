@@ -96,6 +96,7 @@ export const VIDEO_MODELS = [
         supportedModes: ['multi_ref'],
         config: {
             ...BASE_VIDEO_CONFIG,
+            maxReferenceAssets: 50,
             durations: ["-1", ...range(4, 30)],
             defaultDuration: "15",
             resolutions: ["480p", "720p", "1080p"],
@@ -104,7 +105,7 @@ export const VIDEO_MODELS = [
             defaultRatio: "16:9",
             warning: {
                 icon: 'info',
-                text: '不支持真人参考.暂不支持视频参考'
+                text: '不支持真人参考'
             }
         }
     },

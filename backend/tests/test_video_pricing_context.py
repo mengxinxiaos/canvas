@@ -68,18 +68,20 @@ def test_provider_captures_effective_payload_and_actual_response_model(monkeypat
     assert "reference.mp4" not in str(provider.billing_metadata)
 
 
-def test_zhenzhen_counts_only_video_inputs_kept_in_outgoing_payload(monkeypatch):
+def test_zhenzhen_rejects_overflow_instead_of_pricing_a_truncated_payload(monkeypatch):
     monkeypatch.setattr(settings, "ZHENZHEN_API_KEY", "test-key")
     provider = ZhenZhenClient()
 
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(
-            lambda _: httpx.Response(200, json={"id": "remote"})
+            lambda _: pytest.fail("An invalid request must not reach the provider")
         )) as client:
-            await provider.submit_task(client, "test", "model", video_urls=["a", "b", "c", "d"])
+            return await provider.submit_task(client, "test", "model", video_urls=["a", "b", "c", "d"])
 
-    asyncio.run(run())
-    assert provider.billing_metadata["parameters_json"]["video_input_count"] == 3
+    task_id, message = asyncio.run(run())
+    assert task_id is None
+    assert "最多支持 3 个视频" in message
+    assert "parameters_json" not in provider.billing_metadata
 
 
 @pytest.mark.parametrize("requested_mode,image_count,expected_video", [
