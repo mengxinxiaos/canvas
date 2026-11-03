@@ -2,6 +2,8 @@ import asyncio
 import httpx
 from app.core.config import settings
 from app.services.video_generation.base import BaseVideoClient
+from app.services.video_generation.reference_limits import validate_reference_limits
+
 
 class ZhenZhenClient(BaseVideoClient):
     def __init__(self):
@@ -42,6 +44,18 @@ class ZhenZhenClient(BaseVideoClient):
         first_frame_url = kwargs.get("first_frame_url")
         last_frame_url = kwargs.get("last_frame_url")
 
+        # Validate effective inputs before sending anything. Rejecting overflow
+        # is intentional: slicing would silently change the prompt's references.
+        effective_image_count = (
+            1 + int(bool(last_frame_url)) if first_frame_url else len(image_urls)
+        )
+        reference_error = validate_reference_limits(
+            "zhenzhen", model, image_count=effective_image_count,
+            video_count=len(video_urls), audio_count=len(audio_urls),
+        )
+        if reference_error:
+            return None, reference_error
+
         # ==========================================
         # 🚨 即梦专属防线：校验多模态输入规则
         # ==========================================
@@ -60,15 +74,15 @@ class ZhenZhenClient(BaseVideoClient):
         elif first_frame_url:
             content_list.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
         else:
-            for img_url in image_urls[:9]:  # 官方限制最多 9 张
+            for img_url in image_urls:
                 content_list.append({"type": "image_url", "image_url": {"url": img_url}, "role": "reference_image"})
                 
         # 处理视频
-        for vid_url in video_urls[:3]:  # 官方限制最多 3 个
+        for vid_url in video_urls:
             content_list.append({"type": "video_url", "video_url": {"url": vid_url}, "role": "reference_video"})
             
         # 处理音频
-        for aud_url in audio_urls[:3]:  # 官方限制最多 3 个
+        for aud_url in audio_urls:
             content_list.append({"type": "audio_url", "audio_url": {"url": aud_url}, "role": "reference_audio"})
 
         # 3. 拼装 Payload

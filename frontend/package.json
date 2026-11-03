@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test src/utils/referenceMedia.test.js src/components/canvas/generation-panel/utils/mentionDocument.test.js src/components/canvas/generation-panel/utils/panelLayout.test.js tests/generationParams.test.mjs src/services/generationSubmission.test.js src/components/ui/popoverPosition.test.mjs",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "@tiptap/extension-mention": "^3.23.6",

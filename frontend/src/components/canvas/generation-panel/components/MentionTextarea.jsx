@@ -3,11 +3,13 @@ import React, {
     useRef,
     forwardRef,
     useImperativeHandle,
-    useState
+    useState,
+    useCallback
 } from 'react';
 
 import {
     useEditor,
+    useEditorState,
     EditorContent,
     ReactRenderer,
     NodeViewWrapper,
@@ -20,6 +22,12 @@ import tippy from 'tippy.js';
 import 'tippy.js/dist/tippy.css';
 
 import { LinkIcon, X } from 'lucide-react';
+import { getReferenceType, labelReferenceMedia } from '../../../../utils/referenceMedia.js';
+import { syncReferenceMentions } from '../utils/mentionDocument.js';
+import { useOverlayContainer } from '../../../ui/OverlayContainerContext.js';
+import AssetPreview from './AssetPreview.jsx';
+
+const EMPTY_MEDIA = [];
 
 // ==========================================
 // 0. HTML 属性安全转义
@@ -38,39 +46,7 @@ const escapeAttr = (value = '') => {
 const parsePromptToHtml = (text, mediaList) => {
     if (!text) return '';
 
-    let imgCount = 0;
-    let vidCount = 0;
-    let audCount = 0;
-
-    const mediaMap = {};
-
-    mediaList.forEach((media) => {
-        let prefix = '图';
-        let num = 0;
-
-        if (
-            media.type === 'video' ||
-            media.type === 'video_media' ||
-            media.type === 'video_node'
-        ) {
-            prefix = '视';
-            num = ++vidCount;
-        } else if (media.type === 'audio') {
-            prefix = '音';
-            num = ++audCount;
-        } else {
-            prefix = '图';
-            num = ++imgCount;
-        }
-
-        const label = `${prefix}${num}`;
-
-        mediaMap[label] = {
-            id: media.id,
-            src: media.src,
-            type: media.type,
-        };
-    });
+    const mediaMap = new Map(labelReferenceMedia(mediaList).map(media => [media.displayLabel, media]));
 
     let html = text
         .replace(/&/g, '&amp;')
@@ -79,7 +55,7 @@ const parsePromptToHtml = (text, mediaList) => {
         .replace(/\n/g, '<br>');
 
     html = html.replace(/@([图视音]\d+)/g, (match, label) => {
-        const media = mediaMap[label];
+        const media = mediaMap.get(label);
 
         if (!media) {
             return match;
@@ -94,41 +70,40 @@ const parsePromptToHtml = (text, mediaList) => {
 // ==========================================
 // 1. 下拉联想菜单组件
 // ==========================================
-const MentionList = forwardRef((props, ref) => {
-    const [selectedIndex, setSelectedIndex] = useState(0);
+const MentionList = forwardRef(({ items, command }, ref) => {
+    const [selection, setSelection] = useState({ items: items, index: 0 });
+    const selectedIndex = selection.items === items ? selection.index : 0;
 
-    useEffect(() => {
-        setSelectedIndex(0);
-    }, [props.items]);
-
-    const selectItem = (index) => {
-        const item = props.items[index];
+    const selectItem = useCallback((index) => {
+        const item = items[index];
 
         if (item) {
-            props.command({
+            command({
                 id: item.id,
                 label: item.label,
                 src: item.src,
                 mediaType: item.type,
             });
         }
-    };
+    }, [items, command]);
 
     useImperativeHandle(ref, () => ({
         onKeyDown: ({ event }) => {
-            if (!props.items.length) return false;
+            if (!items.length) return false;
 
             if (event.key === 'ArrowUp') {
-                setSelectedIndex(prev =>
-                    (prev + props.items.length - 1) % props.items.length
-                );
+                setSelection({
+                    items: items,
+                    index: (selectedIndex + items.length - 1) % items.length,
+                });
                 return true;
             }
 
             if (event.key === 'ArrowDown') {
-                setSelectedIndex(prev =>
-                    (prev + 1) % props.items.length
-                );
+                setSelection({
+                    items: items,
+                    index: (selectedIndex + 1) % items.length,
+                });
                 return true;
             }
 
@@ -139,9 +114,9 @@ const MentionList = forwardRef((props, ref) => {
 
             return false;
         },
-    }), [props.items, selectedIndex]);
+    }), [items, selectedIndex, selectItem]);
 
-    if (!props.items.length) return null;
+    if (!items.length) return null;
 
     return (
         <div className="z-[150] bg-[#2a2a2a] border border-[#444] rounded-xl shadow-[0_10px_40px_rgba(0,0,0,0.8)] overflow-hidden min-w-[180px]">
@@ -150,7 +125,7 @@ const MentionList = forwardRef((props, ref) => {
             </div>
 
             <div className="max-h-[160px] overflow-y-auto no-wheel">
-                {props.items.map((media, index) => (
+                {items.map((media, index) => (
                     <button
                         key={media.id || index}
                         onClick={() => selectItem(index)}
@@ -161,9 +136,7 @@ const MentionList = forwardRef((props, ref) => {
                         }`}
                     >
                         {(
-                            media.type === 'video' ||
-                            media.type === 'video_media' ||
-                            media.type === 'video_node'
+                            getReferenceType(media) === 'video'
                         ) ? (
                             <video
                                 src={media.src}
@@ -171,9 +144,8 @@ const MentionList = forwardRef((props, ref) => {
                                 preload="metadata"
                                 muted
                                 playsInline
-                                crossOrigin="anonymous"
                             />
-                        ) : media.type === 'audio' ? (
+                        ) : getReferenceType(media) === 'audio' ? (
                             <div className="w-6 h-6 rounded-md border border-black/50 flex items-center justify-center bg-neutral-800 text-[10px]">
                                 🎵
                             </div>
@@ -181,7 +153,6 @@ const MentionList = forwardRef((props, ref) => {
                             <img
                                 src={media.src}
                                 className="w-6 h-6 rounded-md object-cover border border-black/50"
-                                crossOrigin="anonymous"
                                 alt=""
                             />
                         )}
@@ -202,22 +173,24 @@ MentionList.displayName = 'MentionList';
 // 2. 自定义 Mention 胶囊渲染组件
 // ==========================================
 const MentionNodeView = (props) => {
-    const { label, src, mediaType } = props.node.attrs;
+    const { id, label, src, mediaType } = props.node.attrs;
+    const [hover, setHover] = useState(null);
 
     return (
         <NodeViewWrapper as="span" className="inline-block align-middle mx-1 select-none">
-            <span className="flex items-center gap-1.5 bg-[#171724] border border-[#2a2b44] rounded-[6px] p-1 shadow-sm transition-colors hover:border-[#3a3b54]">
+            <span data-mention-preview-trigger
+                className="flex items-center gap-1.5 bg-[#171724] border border-[#2a2b44] rounded-[6px] p-1 shadow-sm transition-colors hover:border-[#3a3b54]"
+                onMouseEnter={event => setHover({ x: event.clientX, y: event.clientY })}
+                onMouseLeave={() => setHover(null)}>
                 {(
-                    mediaType === 'video' ||
-                    mediaType === 'video_media' ||
-                    mediaType === 'video_node'
+                    getReferenceType({ type: mediaType }) === 'video'
                 ) ? (
                     <video
                         src={src}
                         className="w-5 h-5 rounded-[4px] object-cover pointer-events-none"
                         preload="metadata"
                     />
-                ) : mediaType === 'audio' ? (
+                ) : getReferenceType({ type: mediaType }) === 'audio' ? (
                     <span className="w-5 h-5 rounded-[4px] bg-neutral-800 flex items-center justify-center text-[10px] pointer-events-none border border-black/30">
                         🎵
                     </span>
@@ -225,7 +198,6 @@ const MentionNodeView = (props) => {
                     <img
                         src={src}
                         className="w-5 h-5 rounded-[4px] object-cover pointer-events-none"
-                        crossOrigin="anonymous"
                         alt=""
                     />
                 ) : null}
@@ -242,6 +214,9 @@ const MentionNodeView = (props) => {
                     <X size={12} strokeWidth={2.5} />
                 </button>
             </span>
+            {hover && src && (
+                <AssetPreview media={{ id, src, type: mediaType, displayLabel: label }} x={hover.x} y={hover.y} />
+            )}
         </NodeViewWrapper>
     );
 };
@@ -291,17 +266,21 @@ const MentionTextarea = forwardRef(({
     inputPictures,
     inputMedia,
     onSend,
+    expanded = false,
 
     // 新增：父级拖拽排序后，递增这个 key，强制 TipTap 同步内容
     forceSyncKey = 0,
 }, ref) => {
-    // 严谨 fallback：inputMedia 有内容则优先，否则使用 inputPictures
-    const finalMedia = inputMedia?.length ? inputMedia : (inputPictures || []);
+    const getOverlayContainer = useOverlayContainer();
+    // An explicitly empty media list must clear stale legacy image references.
+    const finalMedia = inputMedia ?? inputPictures ?? EMPTY_MEDIA;
 
     const latestProps = useRef({
         finalMedia,
         onSend,
         prompt,
+        setPrompt,
+        getOverlayContainer,
     });
 
     useEffect(() => {
@@ -309,8 +288,10 @@ const MentionTextarea = forwardRef(({
             finalMedia,
             onSend,
             prompt,
+            setPrompt,
+            getOverlayContainer,
         };
-    }, [finalMedia, onSend, prompt]);
+    }, [finalMedia, onSend, prompt, setPrompt, getOverlayContainer]);
 
     const isMenuOpenRef = useRef(false);
     const lastLoadedPromptRef = useRef(null);
@@ -338,6 +319,8 @@ const MentionTextarea = forwardRef(({
                 orderedList: false,
             }),
 
+            // TipTap stores these callbacks and invokes them on editor events.
+            // eslint-disable-next-line react-hooks/refs
             CustomMention.configure({
                 suggestion: {
                     allowedPrefixes: null,
@@ -349,38 +332,9 @@ const MentionTextarea = forwardRef(({
                             return [];
                         }
 
-                        let imgCount = 0;
-                        let vidCount = 0;
-                        let audCount = 0;
-
-                        return mediaList
-                            .map((media) => {
-                                let prefix = '图';
-                                let num = 0;
-
-                                if (
-                                    media.type === 'video' ||
-                                    media.type === 'video_media' ||
-                                    media.type === 'video_node'
-                                ) {
-                                    prefix = '视';
-                                    num = ++vidCount;
-                                } else if (media.type === 'audio') {
-                                    prefix = '音';
-                                    num = ++audCount;
-                                } else {
-                                    prefix = '图';
-                                    num = ++imgCount;
-                                }
-
-                                return {
-                                    ...media,
-                                    label: `${prefix}${num}`,
-                                };
-                            })
-                            .filter(item =>
-                                item.label.toLowerCase().includes(query.toLowerCase())
-                            );
+                        return labelReferenceMedia(mediaList)
+                            .map(media => ({ ...media, label: media.displayLabel }))
+                            .filter(item => item.label.toLowerCase().includes(query.toLowerCase()));
                     },
 
                     render: () => {
@@ -400,7 +354,7 @@ const MentionTextarea = forwardRef(({
 
                                 popup = tippy('body', {
                                     getReferenceClientRect: props.clientRect,
-                                    appendTo: () => document.body,
+                                    appendTo: () => latestProps.current.getOverlayContainer(),
                                     content: component.element,
                                     showOnCreate: true,
                                     interactive: true,
@@ -448,7 +402,7 @@ const MentionTextarea = forwardRef(({
                 class: 'w-full text-[15px] leading-relaxed whitespace-pre-wrap break-all text-neutral-200 cursor-text',
             },
 
-            handleKeyDown: (view, event) => {
+            handleKeyDown: (_view, event) => {
                 // 拦截中文输入法 IME，避免 Enter 误发送
                 if (event.isComposing || event.keyCode === 229) {
                     return false;
@@ -473,157 +427,58 @@ const MentionTextarea = forwardRef(({
 
             lastLoadedPromptRef.current = plainText;
 
-            queueMicrotask(() => {
-                if (editor.isDestroyed) return;
-
-                setPrompt(prev => {
-                    return prev === plainText ? prev : plainText;
-                });
-            });
+            // Keep the parent's prompt ref current before a following Enter key
+            // can submit; deferring this write can reapply an older editor snapshot.
+            latestProps.current.setPrompt(plainText);
         },
     });
 
-    // ==========================================
-    // Hook A：父级 prompt / 媒体顺序变化后的内容重绘
-    // ==========================================
+    // Prompt replacement and ID-based mention reconciliation share one transaction
+    // sequence. Cancel stale queued work when a newer prop snapshot arrives.
     useEffect(() => {
         if (!editor) return;
-
-        const isPromptChanged = lastLoadedPromptRef.current !== prompt;
-        const isMediaChanged = lastParsedMediaSignatureRef.current !== currentMediaSignature;
-        const shouldForceSync = lastForceSyncKeyRef.current !== forceSyncKey;
-
-        if (!isPromptChanged && !isMediaChanged && !shouldForceSync) {
-            return;
-        }
-
-        const htmlContent = parsePromptToHtml(prompt, finalMedia);
+        let cancelled = false;
 
         queueMicrotask(() => {
-            if (editor.isDestroyed) return;
+            if (cancelled || editor.isDestroyed) return;
+            const isPromptChanged = lastLoadedPromptRef.current !== prompt;
+            const isMediaChanged = lastParsedMediaSignatureRef.current !== currentMediaSignature;
+            const shouldForceSync = lastForceSyncKeyRef.current !== forceSyncKey;
 
-            /**
-             * 普通外部更新：
-             * - 编辑器 focus 时不要打断用户输入。
-             *
-             * 强制同步：
-             * - 拖拽资产排序后，prompt 已经被父级重映射。
-             * - 此时必须刷新 TipTap 内容，否则 UI 里还显示旧 @图N。
-             */
-            if (editor.isFocused && !shouldForceSync) {
-                return;
+            if (!isPromptChanged && !isMediaChanged && !shouldForceSync) return;
+
+            if (isPromptChanged || shouldForceSync) {
+                const { from, to } = editor.state.selection;
+                editor.chain()
+                    .setContent(parsePromptToHtml(prompt, finalMedia), { emitUpdate: false })
+                    .command(({ tr }) => {
+                        tr.setMeta('addToHistory', false);
+                        return true;
+                    })
+                    .run();
+                if (editor.isFocused) {
+                    const maxPosition = editor.state.doc.content.size;
+                    editor.commands.setTextSelection({
+                        from: Math.min(from, maxPosition),
+                        to: Math.min(to, maxPosition),
+                    });
+                }
+                lastLoadedPromptRef.current = prompt;
             }
 
-            editor.commands.setContent(htmlContent, {
-                emitUpdate: false,
-            });
+            if (isMediaChanged) {
+                const transaction = syncReferenceMentions(editor.state.tr, finalMedia);
+                if (transaction.docChanged) {
+                    editor.view.dispatch(transaction.setMeta('addToHistory', false));
+                }
+            }
 
-            lastLoadedPromptRef.current = prompt;
             lastParsedMediaSignatureRef.current = currentMediaSignature;
             lastForceSyncKeyRef.current = forceSyncKey;
         });
-    }, [
-        prompt,
-        finalMedia,
-        editor,
-        currentMediaSignature,
-        forceSyncKey
-    ]);
 
-    // ==========================================
-    // Hook B：Mention 节点属性同步器
-    // 响应资产 src/type/label 变化
-    // ==========================================
-    useEffect(() => {
-        if (!editor) return;
-
-        queueMicrotask(() => {
-            if (editor.isDestroyed) return;
-
-            const idToMediaMap = {};
-
-            let imgCount = 0;
-            let vidCount = 0;
-            let audCount = 0;
-
-            finalMedia.forEach((media) => {
-                let prefix = '图';
-                let num = 0;
-
-                if (
-                    media.type === 'video' ||
-                    media.type === 'video_media' ||
-                    media.type === 'video_node'
-                ) {
-                    prefix = '视';
-                    num = ++vidCount;
-                } else if (media.type === 'audio') {
-                    prefix = '音';
-                    num = ++audCount;
-                } else {
-                    prefix = '图';
-                    num = ++imgCount;
-                }
-
-                idToMediaMap[media.id] = {
-                    label: `${prefix}${num}`,
-                    src: media.src,
-                    mediaType: media.type,
-                };
-            });
-
-            const tr = editor.state.tr;
-            let shouldDispatch = false;
-
-            editor.state.doc.descendants((node, pos) => {
-                if (node.type.name !== 'mention') return;
-
-                const currentId = node.attrs.id;
-                const correctMedia = idToMediaMap[currentId];
-
-                if (!correctMedia) {
-                    shouldDispatch = true;
-                    
-                    // 删除失效 mention 节点，避免旧 @图N 误绑定到新的资产
-                    tr.delete(pos, pos + node.nodeSize);
-                    return; 
-                }
-
-                const isLabelChanged = node.attrs.label !== correctMedia.label;
-                const isSrcChanged = node.attrs.src !== correctMedia.src;
-                const isTypeChanged = node.attrs.mediaType !== correctMedia.mediaType;
-
-                if (isLabelChanged || isSrcChanged || isTypeChanged) {
-                    shouldDispatch = true;
-
-                    tr.setNodeMarkup(pos, undefined, {
-                        ...node.attrs,
-                        label: correctMedia.label,
-                        src: correctMedia.src,
-                        mediaType: correctMedia.mediaType,
-                    });
-                }
-            });
-
-            if (shouldDispatch) {
-                editor.view.dispatch(
-                    tr.setMeta('addToHistory', false)
-                );
-
-                const newText = editor.getText();
-                lastLoadedPromptRef.current = newText;
-
-                /**
-                 * 这里不要 setPrompt(newText)。
-                 * prompt 的语义重映射已经由 GenerationPanel 完成。
-                 * 这里如果再次 setPrompt，容易在拖拽中产生竞态。
-                 */
-            }
-        });
-    }, [
-        editor,
-        currentMediaSignature
-    ]);
+        return () => { cancelled = true; };
+    }, [prompt, finalMedia, editor, currentMediaSignature, forceSyncKey]);
 
     // 向外暴露给 PictureTags 调用的插入方法
     useImperativeHandle(ref, () => ({
@@ -647,22 +502,32 @@ const MentionTextarea = forwardRef(({
         },
     }), [editor]);
 
+    const isEditorEmpty = useEditorState({
+        editor,
+        selector: ({ editor: currentEditor }) => currentEditor?.isEmpty ?? true,
+    });
+
     if (!editor) return null;
 
     return (
-        <div className="px-1 mb-4 relative w-full border-none">
-            {editor.isEmpty && (
-                <div className="absolute top-0 left-1 pointer-events-none text-neutral-500 text-[15px] leading-relaxed">
-                    {mode === 'image'
-                        ? '描述你想生成的画面 (输入 @ 引用资产)...'
-                        : '描述你想生成的视频内容 (输入 @ 引用资产)...'}
-                </div>
-            )}
+        <div className={`px-1 relative w-full min-h-0 border-none ${expanded ? 'flex h-full flex-col' : 'mb-4'}`}>
+            <div className={expanded ? 'shrink-0 mb-3 text-xs text-neutral-400' : 'hidden'}>提示词</div>
+            <div className={`relative min-h-0 ${expanded ? 'flex-1' : ''}`}>
+                {isEditorEmpty && (
+                    <div className="absolute top-0 left-0 pointer-events-none text-neutral-500 text-[15px] leading-relaxed">
+                        {mode === 'image'
+                            ? '描述你想生成的画面 (输入 @ 引用资产)...'
+                            : '描述你想生成的视频内容 (输入 @ 引用资产)...'}
+                    </div>
+                )}
 
-            <EditorContent
-                editor={editor}
-                className="no-wheel [&>.ProseMirror]:min-h-[48px] [&>.ProseMirror]:max-h-[500px] [&>.ProseMirror]:overflow-y-auto [&>.ProseMirror]:resize-y [&>.ProseMirror]:outline-none [&>.ProseMirror]:p-0"
-            />
+                <EditorContent
+                    editor={editor}
+                    className={`no-wheel [&>.ProseMirror]:overflow-y-auto [&>.ProseMirror]:outline-none [&>.ProseMirror]:p-0 ${expanded
+                        ? 'h-full min-h-0 [&>.ProseMirror]:h-full [&>.ProseMirror]:min-h-0 [&>.ProseMirror]:max-h-none'
+                        : '[&>.ProseMirror]:min-h-[48px] [&>.ProseMirror]:max-h-[min(180px,25dvh)]'}`}
+                />
+            </div>
         </div>
     );
 });

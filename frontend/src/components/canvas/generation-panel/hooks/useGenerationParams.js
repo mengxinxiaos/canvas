@@ -1,255 +1,127 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import {
-    IMAGE_MODELS,
-    VIDEO_MODELS,
-    getModelConfig,
-    getAvailableModelsByMode
-} from '../../../../config/constants';
+import { getModelConfig } from '../../../../config/models';
+import { createGenerationParams, normalizeGenerationParams } from '../utils/generationParams';
 
-const DEFAULT_IMAGE_MODEL = IMAGE_MODELS[0].value;
-const DEFAULT_VIDEO_MODEL = VIDEO_MODELS[0].value;
+const PARAMETER_KEYS = [
+    'aspectRatio', 'imageSize', 'duration', 'resolution',
+    'gridMode', 'imageStyle', 'videoRefMode',
+];
+
+function serializeParams(params, mode) {
+    return {
+        model: mode === 'image' ? params.imageModel : params.videoModel,
+        ...Object.fromEntries(PARAMETER_KEYS.map(key => [key, params[key]])),
+    };
+}
+
+// Prompt, references and unrelated generation metadata must not reset local controls.
+function parameterSignature(generation, mode) {
+    return JSON.stringify({
+        model: generation.model,
+        ...Object.fromEntries(PARAMETER_KEYS.map(key => [key, generation[key]])),
+        mode,
+    });
+}
 
 export function useGenerationParams(
     anchorNode,
     mode,
     updateNodeData,
     inputPicturesCount = 0,
-    hasMediaInput = false
+    hasMediaInput = false,
+    persistGeneration
 ) {
-    const initVidMode = anchorNode.generation?.videoRefMode || 'first_last';
-
-    let initImgModel = mode === 'image' && anchorNode.generation?.model
-        ? anchorNode.generation.model
-        : DEFAULT_IMAGE_MODEL;
-
-    let initVidModel = mode === 'video' && anchorNode.generation?.model
-        ? anchorNode.generation.model
-        : DEFAULT_VIDEO_MODEL;
-
-    if (mode === 'video') {
-        const availableInitModels = getAvailableModelsByMode('video', initVidMode);
-        const isValid = availableInitModels.some(m => m.value === initVidModel);
-
-        if (!isValid && availableInitModels.length > 0) {
-            initVidModel = availableInitModels[0].value;
-        }
-    }
-
-    const imgConfig = getModelConfig('image', initImgModel);
-    const vidConfig = getModelConfig('video', initVidModel);
-
-    const [params, setParams] = useState({
-        imageModel: initImgModel,
-        videoModel: initVidModel,
-        imageSize: anchorNode.generation?.imageSize || imgConfig.defaultSize,
-        aspectRatio: anchorNode.generation?.aspectRatio || (
-            mode === 'image' ? imgConfig.defaultRatio : vidConfig.defaultRatio
-        ),
-        duration: anchorNode.generation?.duration || vidConfig.defaultDuration,
-        resolution: anchorNode.generation?.resolution || vidConfig.defaultResolution,
-        gridMode: anchorNode.generation?.gridMode || 'standard',
-        imageStyle: anchorNode.generation?.imageStyle || 'custom',
-        videoRefMode: anchorNode.generation?.videoRefMode || 'first_last',
-    });
-
+    const [params, setParams] = useState(() => createGenerationParams(
+        anchorNode.generation || {}, mode, { inputPicturesCount, hasMediaInput }
+    ));
     const stateRef = useRef(params);
     const generationRef = useRef(anchorNode.generation || {});
-
-    useEffect(() => {
-        stateRef.current = params;
-    }, [params]);
+    const sourceSignature = parameterSignature(anchorNode.generation || {}, mode);
+    const observedSourceRef = useRef(sourceSignature);
 
     useEffect(() => {
         generationRef.current = anchorNode.generation || {};
     }, [anchorNode.generation]);
 
-    const currentModelId = mode === 'image'
-        ? params.imageModel
-        : params.videoModel;
+    const currentModelId = mode === 'image' ? params.imageModel : params.videoModel;
+    const config = useMemo(() => getModelConfig(mode, currentModelId), [mode, currentModelId]);
 
-    const config = useMemo(() => {
-        return getModelConfig(mode, currentModelId);
-    }, [mode, currentModelId]);
-    
     const persistParamsToNode = useCallback((nextParams, overrides = {}) => {
-        if (!updateNodeData) return;
-
-        const prevGeneration = generationRef.current || {};
-        const currentModel = mode === 'image'
-            ? nextParams.imageModel
-            : nextParams.videoModel;
-
-        const nextGeneration = {
-            ...prevGeneration,
-
-            model: currentModel,
-            aspectRatio: nextParams.aspectRatio,
-            imageSize: nextParams.imageSize,
-            duration: nextParams.duration,
-            resolution: nextParams.resolution,
-            gridMode: nextParams.gridMode,
-            imageStyle: nextParams.imageStyle,
-            videoRefMode: nextParams.videoRefMode,
-
-            ...overrides,
-        };
-
-        updateNodeData(anchorNode.id, {
-            generation: nextGeneration,
-        });
-
+        const patch = { ...serializeParams(nextParams, mode), ...overrides };
+        if (persistGeneration) {
+            persistGeneration(patch);
+            return;
+        }
+        const nextGeneration = { ...generationRef.current, ...patch };
         generationRef.current = nextGeneration;
-    }, [
-        anchorNode.id,
-        mode,
-        updateNodeData
-    ]);
+        updateNodeData?.(anchorNode.id, { generation: nextGeneration });
+    }, [anchorNode.id, mode, updateNodeData, persistGeneration]);
+
     const updateParam = useCallback((key, value) => {
-        setParams(prev => {
-            const next = {
-                ...prev,
-                [key]: value,
-            };
-
-            if (key === 'imageModel' || key === 'videoModel') {
-                const newConfig = getModelConfig(mode, value);
-
-                if (mode === 'image') {
-                    if (!newConfig.sizes.includes(prev.imageSize)) {
-                        next.imageSize = newConfig.defaultSize;
-                    }
-
-                    if (!newConfig.ratios.includes(prev.aspectRatio)) {
-                        next.aspectRatio = newConfig.defaultRatio;
-                    }
-                } else {
-                    if (!newConfig.durations.includes(prev.duration)) {
-                        next.duration = newConfig.defaultDuration;
-                    }
-
-                    if (!newConfig.resolutions.includes(prev.resolution)) {
-                        next.resolution = newConfig.defaultResolution;
-                    }
-
-                    if (!newConfig.ratios.includes(prev.aspectRatio)) {
-                        next.aspectRatio = newConfig.defaultRatio;
-                    }
-                }
-            }
-
-            if (key === 'videoRefMode' && mode === 'video') {
-                const availableModels = getAvailableModelsByMode('video', value);
-                const isCurrentModelValid = availableModels.some(m => m.value === prev.videoModel);
-
-                if (!isCurrentModelValid && availableModels.length > 0) {
-                    next.videoModel = availableModels[0].value;
-
-                    const newConfig = getModelConfig('video', next.videoModel);
-
-                    if (!newConfig.durations.includes(prev.duration)) {
-                        next.duration = newConfig.defaultDuration;
-                    }
-
-                    if (!newConfig.resolutions.includes(prev.resolution)) {
-                        next.resolution = newConfig.defaultResolution;
-                    }
-
-                    if (!newConfig.ratios.includes(prev.aspectRatio)) {
-                        next.aspectRatio = newConfig.defaultRatio;
-                    }
-                }
-            }
-            // 关键：参数修改后立即写回节点
-            persistParamsToNode(next);
-            return next;
-        });
-    }, [
-        mode,
-        persistParamsToNode
-    ]);
+        const next = normalizeGenerationParams(
+            { ...stateRef.current, [key]: value },
+            mode,
+            { inputPicturesCount, hasMediaInput }
+        );
+        // Update the ref in the event, so rapid edits and immediate saves see the same values.
+        // Persistence is deliberately outside a React state updater (StrictMode can replay it).
+        stateRef.current = next;
+        setParams(next);
+        persistParamsToNode(next);
+        return next;
+    }, [mode, inputPicturesCount, hasMediaInput, persistParamsToNode]);
 
     useEffect(() => {
-        if (mode !== 'video') return;
+        let cancelled = false;
+        queueMicrotask(() => {
+            if (cancelled) return;
+            const sourceChanged = observedSourceRef.current !== sourceSignature;
+            observedSourceRef.current = sourceSignature;
+            let source = stateRef.current;
 
-        const shouldForceMultiRef = inputPicturesCount >= 3 || hasMediaInput;
+            // The node store is authoritative. A prior value can be an intentional
+            // undo/redo; value signatures are not persistence revision numbers.
+            if (sourceChanged) {
+                source = createGenerationParams(JSON.parse(sourceSignature), mode, {
+                    inputPicturesCount, hasMediaInput,
+                });
+            }
 
-        if (shouldForceMultiRef && params.videoRefMode !== 'multi_ref') {
-            updateParam('videoRefMode', 'multi_ref');
-        }
-    }, [
-        inputPicturesCount,
-        hasMediaInput,
-        mode,
-        params.videoRefMode,
-        updateParam
-    ]);
+            const next = normalizeGenerationParams(source, mode, {
+                inputPicturesCount, hasMediaInput,
+            });
+            const nextSignature = parameterSignature(serializeParams(next, mode), mode);
+            const currentSignature = parameterSignature(serializeParams(stateRef.current, mode), mode);
+            if (nextSignature === currentSignature) return;
+
+            stateRef.current = next;
+            setParams(next);
+            // Reference constraints can force a supported mode. Store that correction
+            // without treating unrelated source metadata as a parameter change.
+            if (!sourceChanged) persistParamsToNode(next);
+        });
+        return () => { cancelled = true; };
+    }, [sourceSignature, mode, inputPicturesCount, hasMediaInput, persistParamsToNode]);
+
+    const getParams = useCallback(() => stateRef.current, []);
 
     const syncToNode = useCallback((overrides = {}) => {
-        if (!updateNodeData) return;
+        const next = normalizeGenerationParams(
+            { ...stateRef.current, ...overrides },
+            mode,
+            { inputPicturesCount, hasMediaInput }
+        );
+        stateRef.current = next;
+        setParams(next);
+        // Only explicitly supplied prompt/reference fields are written; parameter edits
+        // must never reset the asset order or the latest prompt.
+        const extraGeneration = Object.fromEntries(
+            ['prompt', 'inputs', 'referenceNodeIds', 'rawPrompt', 'finalPrompt', 'apiMode']
+                .filter(key => overrides[key] !== undefined)
+                .map(key => [key, overrides[key]])
+        );
+        persistParamsToNode(next, extraGeneration);
+    }, [mode, inputPicturesCount, hasMediaInput, persistParamsToNode]);
 
-        const s = {
-            ...stateRef.current,
-            ...overrides,
-        };
-
-        const prevGeneration = generationRef.current || {};
-        const currentModel = mode === 'image' ? s.imageModel : s.videoModel;
-
-        const nextGeneration = {
-            ...prevGeneration,
-
-            model: currentModel,
-            aspectRatio: s.aspectRatio,
-            imageSize: s.imageSize,
-            duration: s.duration,
-            resolution: s.resolution,
-            gridMode: s.gridMode,
-            imageStyle: s.imageStyle,
-            videoRefMode: s.videoRefMode,
-
-            prompt: s.prompt !== undefined
-                ? s.prompt
-                : prevGeneration.prompt,
-        };
-
-        // 关键：引用资产数据只有明确传入时才写。
-        // 参数更新、关闭面板、普通 prompt 保存，不应该默认覆盖引用顺序。
-        if (overrides.inputs !== undefined) {
-            nextGeneration.inputs = overrides.inputs;
-        }
-
-        if (overrides.referenceNodeIds !== undefined) {
-            nextGeneration.referenceNodeIds = overrides.referenceNodeIds;
-        }
-
-        if (overrides.rawPrompt !== undefined) {
-            nextGeneration.rawPrompt = overrides.rawPrompt;
-        }
-
-        if (overrides.finalPrompt !== undefined) {
-            nextGeneration.finalPrompt = overrides.finalPrompt;
-        }
-
-        if (overrides.apiMode !== undefined) {
-            nextGeneration.apiMode = overrides.apiMode;
-        }
-
-        updateNodeData(anchorNode.id, {
-            generation: nextGeneration,
-        });
-
-        // 关键：立即刷新 ref，避免下一次 syncToNode 又拿旧 generation。
-        generationRef.current = nextGeneration;
-    }, [
-        anchorNode.id,
-        mode,
-        updateNodeData
-    ]);
-
-    return {
-        params,
-        updateParam,
-        syncToNode,
-        config,
-    };
+    return { params, updateParam, syncToNode, getParams, config };
 }
